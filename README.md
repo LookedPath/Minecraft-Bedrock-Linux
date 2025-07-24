@@ -130,7 +130,126 @@ DOWNLOAD_URL="https://minecraft.azureedge.net/bin-linux/bedrock-server-1.21.44.0
 
 # Backup retention
 BACKUP_RETENTION_DAYS=30                        # Keep backups for 30 days
+
+# Telegram Bot Configuration (optional)
+TELEGRAM_ENABLED="false"                        # Enable/disable Telegram notifications
+TELEGRAM_BOT_TOKEN=""                           # Bot token from @BotFather
+TELEGRAM_CHAT_IDS=""                            # Chat ID(s) for notifications
+TELEGRAM_NOTIFY_UPDATE_START="true"             # Notify when update starts
+TELEGRAM_NOTIFY_UPDATE_SUCCESS="true"           # Notify when update succeeds
+TELEGRAM_NOTIFY_UPDATE_FAILURE="true"           # Notify when update fails
+TELEGRAM_NOTIFY_NO_UPDATE="false"               # Notify when no update needed
 ```
+
+## Telegram Bot Notifications
+
+The scripts support optional Telegram bot notifications to keep you informed about server updates and status changes. This feature allows you to receive real-time notifications on your phone or computer whenever the server is updated, encounters errors, or when maintenance is performed.
+
+### Features
+
+- **Real-time Notifications**: Get instant updates about server status
+- **Multiple Recipients**: Send notifications to multiple users or groups
+- **Configurable Events**: Choose which events trigger notifications
+- **Rich Formatting**: Messages include emojis, timestamps, and server details
+- **Error Resilience**: Script continues even if Telegram notifications fail
+
+### Setting Up Telegram Notifications
+
+#### 1. Create a Telegram Bot
+
+1. Open Telegram and search for `@BotFather`
+2. Start a chat and send `/start`
+3. Send `/newbot` to create a new bot
+4. Follow the prompts to name your bot and choose a username
+5. Save the API token provided (format: `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
+
+#### 2. Get Your Chat ID
+
+**For personal notifications:**
+1. Search for `@userinfobot` in Telegram
+2. Start a chat and send any message
+3. Note the Chat ID from the response (e.g., `123456789`)
+
+**For group notifications:**
+1. Add your bot to the group and make it an admin
+2. Send a message mentioning your bot: `@yourbotname hello`
+3. Visit `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
+4. Find the "chat" object and note the "id" field (negative for groups: `-987654321`)
+
+#### 3. Configure the Scripts
+
+Edit `config.sh` and update the Telegram settings:
+
+```bash
+# Enable Telegram notifications
+TELEGRAM_ENABLED="true"
+
+# Your bot token from BotFather
+TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+
+# Chat ID(s) where notifications will be sent
+# For multiple recipients, separate with spaces: "123456789 -987654321"
+TELEGRAM_CHAT_IDS="123456789"
+
+# Choose which events to be notified about
+TELEGRAM_NOTIFY_UPDATE_START="true"     # When update process begins
+TELEGRAM_NOTIFY_UPDATE_SUCCESS="true"   # When update completes successfully
+TELEGRAM_NOTIFY_UPDATE_FAILURE="true"   # When update fails or errors occur
+TELEGRAM_NOTIFY_NO_UPDATE="false"       # When script runs but no update needed
+```
+
+### Notification Types
+
+The script sends formatted messages for different events:
+
+- **🔄 Update Start**: Notifies when the update process begins, including current version
+- **✅ Update Success**: Confirms successful update with version change details
+- **❌ Update Failure**: Alerts about errors with troubleshooting information
+- **ℹ️ No Update Needed**: Confirms server is already up to date (optional)
+
+### Example Notification
+
+```
+✅ Minecraft Server Update Completed
+
+📅 Time: 2025-07-24 14:30:15
+🖥️ Server: minecraft-server
+📦 Updated: 1.21.44.01 → 1.21.50.07
+
+🎮 Server is ready to play!
+```
+
+### Testing Your Configuration
+
+1. Enable notifications in `config.sh`
+2. Temporarily set `TELEGRAM_NOTIFY_NO_UPDATE="true"`
+3. Run the update script when no update is available
+4. You should receive a "no update needed" notification
+
+### Troubleshooting Telegram
+
+**Bot doesn't send messages:**
+- Verify `TELEGRAM_ENABLED="true"`
+- Check bot token is correct and complete
+- Ensure chat ID is accurate
+- Confirm you've started a chat with the bot (`/start`)
+
+**Messages not received:**
+- Check internet connectivity to `api.telegram.org`
+- For groups, ensure bot has permission to send messages
+- Verify bot is not blocked or restricted
+
+**Check logs for details:**
+```bash
+tail -f /var/log/minecraft/minecraft-server.log
+```
+
+### Security Notes
+
+- Keep your bot token secure and never share it publicly
+- Set restrictive file permissions on `config.sh`
+- Consider using environment variables for tokens in production
+- The bot can only send to chats where it's been explicitly added
 
 ## Usage
 
@@ -386,6 +505,7 @@ Add a cron job to run backups periodically:
 - sudo
 - systemd (optional)
 - UFW (optional, for automatic firewall configuration)
+- Internet connection (for downloads and Telegram notifications)
 
 ## License
 

@@ -80,6 +80,142 @@ check_requirements() {
     log DEBUG "System requirements check completed"
 }
 
+# Send Telegram notification
+send_telegram_message() {
+    local message="$1"
+    local parse_mode="${2:-}"
+    
+    # Check if Telegram notifications are enabled
+    if [[ "$TELEGRAM_ENABLED" != "true" ]]; then
+        log DEBUG "Telegram notifications are disabled"
+        return 0
+    fi
+    
+    # Check if bot token and chat IDs are configured
+    if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
+        log WARN "Telegram bot token not configured, skipping notification"
+        return 1
+    fi
+    
+    if [[ -z "$TELEGRAM_CHAT_IDS" ]]; then
+        log WARN "Telegram chat IDs not configured, skipping notification"
+        return 1
+    fi
+    
+    log DEBUG "Sending Telegram notification..."
+    
+    # Prepare the API URL
+    local api_url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    # Send message to each chat ID
+    local chat_ids_array=($TELEGRAM_CHAT_IDS)
+    local success_count=0
+    local total_count=${#chat_ids_array[@]}
+    
+    for chat_id in "${chat_ids_array[@]}"; do
+        log DEBUG "Sending message to chat ID: $chat_id"
+        
+        # Prepare POST data
+        local post_data="chat_id=${chat_id}&text=${message}"
+        if [[ -n "$parse_mode" ]]; then
+            post_data="${post_data}&parse_mode=${parse_mode}"
+        fi
+        
+        # Send the message with timeout
+        local response=$(timeout 30 wget --timeout=15 --tries=2 \
+            --post-data="$post_data" \
+            --header="Content-Type: application/x-www-form-urlencoded" \
+            --user-agent="$USER_AGENT" \
+            -q -O - "$api_url" 2>/dev/null)
+        
+        if [[ $? -eq 0 ]] && echo "$response" | grep -q '"ok":true'; then
+            log DEBUG "Message sent successfully to chat ID: $chat_id"
+            ((success_count++))
+        else
+            log WARN "Failed to send message to chat ID: $chat_id"
+            log DEBUG "Response: $response"
+        fi
+    done
+    
+    if [[ $success_count -eq $total_count ]]; then
+        log DEBUG "Telegram notification sent successfully to all recipients"
+        return 0
+    elif [[ $success_count -gt 0 ]]; then
+        log WARN "Telegram notification sent to $success_count out of $total_count recipients"
+        return 0
+    else
+        log ERROR "Failed to send Telegram notification to any recipient"
+        return 1
+    fi
+}
+
+# Send update start notification
+notify_update_start() {
+    if [[ "$TELEGRAM_NOTIFY_UPDATE_START" == "true" ]]; then
+        local hostname=$(hostname)
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        local message="🔄 *Minecraft Server Update Started*%0A%0A"
+        message+="📅 Time: $timestamp%0A"
+        message+="🖥️ Server: $hostname%0A"
+        message+="📦 Current version: $INSTALLED_VERSION%0A%0A"
+        message+="⏳ Update is in progress..."
+        
+        send_telegram_message "$message" "Markdown"
+    fi
+}
+
+# Send update success notification
+notify_update_success() {
+    local old_version="$1"
+    local new_version="$2"
+    
+    if [[ "$TELEGRAM_NOTIFY_UPDATE_SUCCESS" == "true" ]]; then
+        local hostname=$(hostname)
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        local message="✅ *Minecraft Server Update Completed*%0A%0A"
+        message+="📅 Time: $timestamp%0A"
+        message+="🖥️ Server: $hostname%0A"
+        message+="📦 Updated: $old_version → $new_version%0A%0A"
+        message+="🎮 Server is ready to play!"
+        
+        send_telegram_message "$message" "Markdown"
+    fi
+}
+
+# Send update failure notification
+notify_update_failure() {
+    local error_message="$1"
+    
+    if [[ "$TELEGRAM_NOTIFY_UPDATE_FAILURE" == "true" ]]; then
+        local hostname=$(hostname)
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        local message="❌ *Minecraft Server Update Failed*%0A%0A"
+        message+="📅 Time: $timestamp%0A"
+        message+="🖥️ Server: $hostname%0A"
+        message+="⚠️ Error: ${error_message:-Unknown error}%0A%0A"
+        message+="🔧 Manual intervention may be required."
+        
+        send_telegram_message "$message" "Markdown"
+    fi
+}
+
+# Send no update needed notification
+notify_no_update() {
+    local current_version="$1"
+    
+    if [[ "$TELEGRAM_NOTIFY_NO_UPDATE" == "true" ]]; then
+        local hostname=$(hostname)
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        local message="ℹ️ *Minecraft Server Check Complete*%0A%0A"
+        message+="📅 Time: $timestamp%0A"
+        message+="🖥️ Server: $hostname%0A"
+        message+="📦 Version: $current_version%0A%0A"
+        message+="✅ Server is already up to date!"
+        
+        send_telegram_message "$message" "Markdown"
+    fi
+}
+
 # Create necessary directories
 setup_directories() {
     log INFO "Setting up directories..."
@@ -307,6 +443,7 @@ download_server() {
     # Download with progress bar
     if ! wget --progress=bar:force:noscroll --user-agent="$USER_AGENT" -O "$filename" "$download_url"; then
         log ERROR "Failed to download server from $download_url"
+        notify_update_failure "Failed to download server from $download_url"
         exit 1
     fi
     
@@ -542,11 +679,13 @@ main() {
     # Check if update is actually needed
     if ! check_update_needed "$installed_version" "$latest_version"; then
         log INFO "No update required. Exiting."
+        notify_no_update "$installed_version"
         exit 0
     fi
     
     # If we get here, an update is needed
     log INFO "Update required, proceeding with server update..."
+    notify_update_start
     
     # Check if server is currently running (only now that we know we need to update)
     local server_was_running=false
@@ -586,6 +725,9 @@ main() {
     log INFO "Minecraft Bedrock Server update completed successfully!"
     log INFO "Updated from version $installed_version to $latest_version"
     
+    # Send success notification
+    notify_update_success "$installed_version" "$latest_version"
+    
     # Restart server if it was running before
     if [[ "$server_was_running" == "true" ]]; then
         log INFO "Restarting server as it was running before the update..."
@@ -597,6 +739,23 @@ main() {
 }
 
 # Handle script interruption
+cleanup_and_notify_error() {
+    local exit_code=$?
+    local line_number=${1:-"unknown"}
+    
+    cleanup_temp
+    
+    if [[ $exit_code -ne 0 ]]; then
+        local error_msg="Script failed at line $line_number with exit code $exit_code"
+        log ERROR "$error_msg"
+        notify_update_failure "$error_msg"
+    fi
+    
+    exit $exit_code
+}
+
+# Set up error handling
+trap 'cleanup_and_notify_error $LINENO' ERR
 trap cleanup_temp EXIT
 
 # Run main function

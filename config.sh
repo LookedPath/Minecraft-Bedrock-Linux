@@ -43,3 +43,22 @@ WORLD_DIRS=(
     "behavior_packs"
     "resource_packs"
 )
+
+# Telegram Bot Configuration
+# Set TELEGRAM_ENABLED to "true" to enable Telegram notifications, "false" to disable
+TELEGRAM_ENABLED="false"
+
+# Telegram Bot API Token (get from @BotFather on Telegram)
+# Example: "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+TELEGRAM_BOT_TOKEN=""
+
+# Telegram Chat ID(s) where notifications will be sent
+# You can get your chat ID by messaging @userinfobot on Telegram
+# For multiple recipients, separate with spaces: "123456789 -987654321"
+TELEGRAM_CHAT_IDS=""
+
+# Notification settings
+TELEGRAM_NOTIFY_UPDATE_START="true"     # Notify when update process starts
+TELEGRAM_NOTIFY_UPDATE_SUCCESS="true"   # Notify when update completes successfully
+TELEGRAM_NOTIFY_UPDATE_FAILURE="true"   # Notify when update fails
+TELEGRAM_NOTIFY_NO_UPDATE="false"       # Notify when no update is needed
