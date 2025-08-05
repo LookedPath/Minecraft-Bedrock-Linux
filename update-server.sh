@@ -197,7 +197,11 @@ notify_update_success() {
         message+="📦 Updated: $old_version → $new_version%0A%0A"
         message+="🎮 Server is ready to play!"
         
-        send_telegram_message "$message" "Markdown"
+        if send_telegram_message "$message" "Markdown"; then
+            log DEBUG "Update success notification sent successfully"
+        else
+            log WARN "Failed to send update success notification, but continuing"
+        fi
     fi
 }
 
@@ -214,7 +218,11 @@ notify_update_failure() {
         message+="⚠️ Error: ${error_message:-Unknown error}%0A%0A"
         message+="🔧 Manual intervention may be required."
         
-        send_telegram_message "$message" "Markdown"
+        if send_telegram_message "$message" "Markdown"; then
+            log DEBUG "Update failure notification sent successfully"
+        else
+            log WARN "Failed to send update failure notification"
+        fi
     fi
 }
 
@@ -231,7 +239,11 @@ notify_no_update() {
         message+="📦 Version: $current_version%0A%0A"
         message+="✅ Server is already up to date!"
         
-        send_telegram_message "$message" "Markdown"
+        if send_telegram_message "$message" "Markdown"; then
+            log DEBUG "No update notification sent successfully"
+        else
+            log WARN "Failed to send no update notification"
+        fi
     fi
 }
 
