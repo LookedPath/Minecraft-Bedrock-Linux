@@ -38,11 +38,8 @@ log() {
 
 # Check if server is running
 is_server_running() {
-    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME"; then
-        return 0
-    else
-        return 1
-    fi
+    sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null || return 1
+    return 0
 }
 
 # Send a message to all players before shutdown
@@ -54,7 +51,10 @@ send_shutdown_warning() {
     local message="Server will shut down in $countdown seconds. Please save your progress!"
     
     # Send the message to the server console
-    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "say $message\n"
+    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "say $message\n" || {
+        log WARN "Failed to send shutdown warning"
+        return 1
+    }
 }
 
 # Send a command to the server console
@@ -62,7 +62,10 @@ send_server_command() {
     local command="$1"
     
     if is_server_running; then
-        sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "$command\n"
+        sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "$command\n" || {
+            log ERROR "Failed to send command: $command"
+            return 1
+        }
         return 0
     else
         log ERROR "Server is not running"
@@ -84,15 +87,15 @@ graceful_stop() {
     # If not forcing, send warnings to players
     if [[ "$force" != "force" ]]; then
         # Send warnings at 60, 30, 15, 5 seconds
-        send_shutdown_warning 60
+        send_shutdown_warning 60 || log WARN "Failed to send first shutdown warning"
         sleep 45
         
         if is_server_running; then
-            send_shutdown_warning 15
+            send_shutdown_warning 15 || log WARN "Failed to send second shutdown warning"
             sleep 10
             
             if is_server_running; then
-                send_shutdown_warning 5
+                send_shutdown_warning 5 || log WARN "Failed to send final shutdown warning"
                 sleep 5
             fi
         fi
@@ -101,23 +104,27 @@ graceful_stop() {
     if is_server_running; then
         # Save the world before stopping
         log INFO "Saving world data..."
-        send_server_command "save hold"
+        send_server_command "save hold" || log WARN "Failed to send 'save hold' command"
         sleep 2
-        send_server_command "save query"
+        send_server_command "save query" || log WARN "Failed to send 'save query' command"
         sleep 3
-        send_server_command "save resume"
+        send_server_command "save resume" || log WARN "Failed to send 'save resume' command"
         sleep 2
         
         # Send stop command
         log INFO "Sending stop command to server..."
-        send_server_command "stop"
+        send_server_command "stop" || log WARN "Failed to send 'stop' command"
         
         # Wait for server to stop (max 60 seconds)
         local count=0
         local max_wait=60
         
         log INFO "Waiting for server to stop (max $max_wait seconds)..."
-        while is_server_running && [[ $count -lt $max_wait ]]; do
+        while [[ $count -lt $max_wait ]]; do
+            if ! is_server_running; then
+                break
+            fi
+            
             sleep 1
             ((count++))
             
@@ -130,7 +137,10 @@ graceful_stop() {
         if is_server_running; then
             log WARN "Server didn't stop gracefully within $max_wait seconds"
             log WARN "Killing screen session..."
-            sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit
+            sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || {
+                log ERROR "Failed to kill screen session"
+                return 1
+            }
             sleep 2
             
             if is_server_running; then
@@ -157,7 +167,10 @@ force_stop() {
     log WARN "Force stopping Minecraft Bedrock Server..."
     
     # Kill the screen session immediately
-    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit
+    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || {
+        log ERROR "Failed to kill screen session"
+        return 1
+    }
     sleep 2
     
     if is_server_running; then
