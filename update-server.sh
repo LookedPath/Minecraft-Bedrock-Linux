@@ -471,21 +471,47 @@ extract_server() {
 
 # Check if server is running
 is_server_running() {
-    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME"; then
-        return 0
+    log DEBUG "Checking if server is running (user: $SERVER_USER, session: $SCREEN_SESSION_NAME)"
+    
+    # Check if the user exists
+    if ! id "$SERVER_USER" &>/dev/null; then
+        log DEBUG "User $SERVER_USER does not exist"
+        return 1
+    fi
+    
+    # Check if screen command is available
+    if ! command -v screen &>/dev/null; then
+        log DEBUG "Screen command not available"
+        return 1
+    fi
+    
+    # Use a more robust approach to check for running screen sessions
+    local screen_output=""
+    if screen_output=$(sudo -u "$SERVER_USER" screen -list 2>/dev/null); then
+        log DEBUG "Screen list output: $screen_output"
+        if echo "$screen_output" | grep -q "$SCREEN_SESSION_NAME"; then
+            log DEBUG "Server screen session found"
+            return 0
+        else
+            log DEBUG "Server screen session not found"
+            return 1
+        fi
     else
+        log DEBUG "Failed to get screen list or no screen sessions found"
         return 1
     fi
 }
 
 # Stop the server gracefully using the stop-server script
 stop_server() {
+    log DEBUG "Attempting to stop server..."
     if is_server_running; then
         log INFO "Stopping Minecraft server using stop-server.sh..."
         if "$SCRIPT_DIR/stop-server.sh"; then
             log INFO "Server stopped successfully"
         else
             log ERROR "Failed to stop server gracefully"
+            log ERROR "This may prevent the update from proceeding safely"
             exit 1
         fi
     else
@@ -687,7 +713,10 @@ main() {
     log INFO "Update required, proceeding with server update..."
     notify_update_start
     
+    log DEBUG "Starting update process after notification sent"
+    
     # Check if server is currently running (only now that we know we need to update)
+    log DEBUG "About to check if server is running..."
     local server_was_running=false
     if is_server_running; then
         server_was_running=true
@@ -695,6 +724,8 @@ main() {
     else
         log INFO "Server is not currently running"
     fi
+    
+    log DEBUG "Server running check completed, proceeding to stop server if needed..."
     
     # Stop server if running (only if update is needed)
     stop_server
@@ -743,10 +774,15 @@ cleanup_and_notify_error() {
     local exit_code=$?
     local line_number=${1:-"unknown"}
     
+    log ERROR "Script interrupted or failed at line $line_number with exit code $exit_code"
+    log ERROR "This may have occurred during: server status check, server stop, backup, download, or installation"
+    log DEBUG "Call stack: ${BASH_SOURCE[*]}"
+    log DEBUG "Function stack: ${FUNCNAME[*]}"
+    
     cleanup_temp
     
     if [[ $exit_code -ne 0 ]]; then
-        local error_msg="Script failed at line $line_number with exit code $exit_code"
+        local error_msg="Script failed at line $line_number with exit code $exit_code. Check logs for details."
         log ERROR "$error_msg"
         notify_update_failure "$error_msg"
     fi
