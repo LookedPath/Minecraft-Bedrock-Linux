@@ -731,8 +731,10 @@ EOF
 
 # Cleanup temporary files
 cleanup_temp() {
-    log INFO "Cleaning up temporary files..."
-    rm -rf "$TEMP_DIR"
+    if [[ -d "$TEMP_DIR" ]]; then
+        log INFO "Cleaning up temporary files..."
+        rm -rf "$TEMP_DIR"
+    fi
 }
 
 # Main update process
@@ -825,8 +827,7 @@ main() {
     # Install new server
     install_server "$extract_dir" "$preserve_dir"
     
-    # Cleanup
-    cleanup_temp
+    # Cleanup (but keep temp dir for now in case restart fails)
     cleanup_old_backups
     
     log INFO "Minecraft Bedrock Server update completed successfully!"
@@ -844,6 +845,9 @@ main() {
         log INFO "Server was not running before update, leaving it stopped"
         log INFO "You can start the server using: $SCRIPT_DIR/start-server.sh"
     fi
+    
+    # Final cleanup
+    cleanup_temp
 }
 
 # Handle script interruption
@@ -856,6 +860,8 @@ cleanup_and_notify_error() {
     log DEBUG "Call stack: ${BASH_SOURCE[*]}"
     log DEBUG "Function stack: ${FUNCNAME[*]}"
     
+    # Cleanup and disable the EXIT trap to prevent double cleanup
+    trap - EXIT
     cleanup_temp
     
     if [[ $exit_code -ne 0 ]]; then
@@ -869,7 +875,7 @@ cleanup_and_notify_error() {
 
 # Set up error handling
 trap 'cleanup_and_notify_error $LINENO' ERR
-trap cleanup_temp EXIT
+# Note: EXIT trap removed to prevent interference with normal script completion
 
 # Run main function
 main "$@"
