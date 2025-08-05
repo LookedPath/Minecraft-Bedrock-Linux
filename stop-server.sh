@@ -38,17 +38,33 @@ log() {
 
 # Check if server is running
 is_server_running() {
+    local screen_running=false
+    local process_running=false
+    
     # First check if screen session exists
-    if ! sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
-        return 1
+    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
+        screen_running=true
     fi
     
     # Then check if the bedrock_server process is actually running
-    if ! sudo -u "$SERVER_USER" pgrep -f "$SERVER_EXECUTABLE" >/dev/null 2>&1; then
-        return 1
+    # Use multiple methods to be more reliable
+    if sudo -u "$SERVER_USER" pgrep -x "$SERVER_EXECUTABLE" >/dev/null 2>&1; then
+        process_running=true
+    elif sudo -u "$SERVER_USER" pgrep -f "\./$SERVER_EXECUTABLE" >/dev/null 2>&1; then
+        process_running=true
+    elif sudo -u "$SERVER_USER" ps aux | grep -v grep | grep -q "$SERVER_EXECUTABLE"; then
+        process_running=true
     fi
     
-    return 0
+    # Debug output (uncomment for troubleshooting)
+    log DEBUG "Screen session running: $screen_running, Process running: $process_running"
+    
+    # Server is considered running if BOTH screen session exists AND process is running
+    if [[ "$screen_running" == true && "$process_running" == true ]]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 # Send a message to all players before shutdown
@@ -124,13 +140,25 @@ graceful_stop() {
         log INFO "Sending stop command to server..."
         send_server_command "stop" || log WARN "Failed to send 'stop' command"
         
+        # Give the server a moment to process the stop command
+        sleep 5
+        
+        # Do an immediate check to see if server stopped quickly
+        if ! is_server_running; then
+            log INFO "Server stopped quickly after stop command"
+        else
+            log INFO "Server still running, continuing to wait..."
+        fi
+        
         # Wait for server to stop (max 60 seconds)
         local count=0
         local max_wait=60
         
         log INFO "Waiting for server to stop (max $max_wait seconds)..."
         while [[ $count -lt $max_wait ]]; do
+            # Check if server is still running
             if ! is_server_running; then
+                log INFO "Server stopped after $count seconds"
                 break
             fi
             
@@ -140,6 +168,23 @@ graceful_stop() {
             # Show progress every 10 seconds
             if [[ $((count % 10)) -eq 0 ]]; then
                 log INFO "Still waiting... ($count/$max_wait seconds)"
+                
+                # Additional debug info every 20 seconds
+                if [[ $((count % 20)) -eq 0 ]]; then
+                    local screen_status="not found"
+                    local process_status="not found"
+                    
+                    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
+                        screen_status="running"
+                    fi
+                    
+                    if sudo -u "$SERVER_USER" pgrep -x "$SERVER_EXECUTABLE" >/dev/null 2>&1 || \
+                       sudo -u "$SERVER_USER" pgrep -f "\./$SERVER_EXECUTABLE" >/dev/null 2>&1; then
+                        process_status="running"
+                    fi
+                    
+                    log DEBUG "Status check - Screen: $screen_status, Process: $process_status"
+                fi
             fi
         done
         
