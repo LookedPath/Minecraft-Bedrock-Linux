@@ -38,7 +38,16 @@ log() {
 
 # Check if server is running
 is_server_running() {
-    sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null || return 1
+    # First check if screen session exists
+    if ! sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
+        return 1
+    fi
+    
+    # Then check if the bedrock_server process is actually running
+    if ! sudo -u "$SERVER_USER" pgrep -f "$SERVER_EXECUTABLE" >/dev/null 2>&1; then
+        return 1
+    fi
+    
     return 0
 }
 
@@ -138,10 +147,19 @@ graceful_stop() {
             log WARN "Server didn't stop gracefully within $max_wait seconds"
             log WARN "Killing screen session..."
             sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || {
-                log ERROR "Failed to kill screen session"
-                return 1
+                log WARN "Failed to kill screen session gracefully"
             }
             sleep 2
+            
+            # Also kill any remaining bedrock_server processes
+            if sudo -u "$SERVER_USER" pgrep -f "$SERVER_EXECUTABLE" >/dev/null 2>&1; then
+                log WARN "Killing remaining bedrock_server processes..."
+                sudo -u "$SERVER_USER" pkill -f "$SERVER_EXECUTABLE" || {
+                    log ERROR "Failed to kill bedrock_server processes"
+                    return 1
+                }
+                sleep 2
+            fi
             
             if is_server_running; then
                 log ERROR "Failed to stop server"
@@ -151,6 +169,11 @@ graceful_stop() {
             fi
         else
             log INFO "Server stopped gracefully"
+            # Clean up any lingering screen session
+            if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
+                log INFO "Cleaning up screen session..."
+                sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || true
+            fi
         fi
     fi
     
@@ -166,12 +189,26 @@ force_stop() {
     
     log WARN "Force stopping Minecraft Bedrock Server..."
     
-    # Kill the screen session immediately
-    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || {
-        log ERROR "Failed to kill screen session"
-        return 1
-    }
-    sleep 2
+    # First try to kill the bedrock_server process
+    if sudo -u "$SERVER_USER" pgrep -f "$SERVER_EXECUTABLE" >/dev/null 2>&1; then
+        log INFO "Killing bedrock_server processes..."
+        sudo -u "$SERVER_USER" pkill -f "$SERVER_EXECUTABLE" || {
+            log WARN "Failed to kill bedrock_server processes gracefully, trying with SIGKILL..."
+            sudo -u "$SERVER_USER" pkill -9 -f "$SERVER_EXECUTABLE" || {
+                log ERROR "Failed to kill bedrock_server processes"
+            }
+        }
+        sleep 2
+    fi
+    
+    # Then kill the screen session
+    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
+        log INFO "Killing screen session..."
+        sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || {
+            log WARN "Failed to kill screen session gracefully"
+        }
+        sleep 2
+    fi
     
     if is_server_running; then
         log ERROR "Failed to force stop server"
