@@ -530,7 +530,10 @@ stop_server() {
         
         # Use timeout to prevent hanging indefinitely
         # Allow up to 3 minutes (180 seconds) for graceful shutdown
-        if timeout 180 "$SCRIPT_DIR/stop-server.sh"; then
+        local stop_exit_code=0
+        timeout 180 "$SCRIPT_DIR/stop-server.sh" || stop_exit_code=$?
+        
+        if [[ $stop_exit_code -eq 0 ]]; then
             log INFO "Server stopped successfully"
             
             # Double-check that the server actually stopped
@@ -547,8 +550,7 @@ stop_server() {
                 log DEBUG "Server confirmed stopped"
             fi
         else
-            local exit_code=$?
-            if [[ $exit_code -eq 124 ]]; then
+            if [[ $stop_exit_code -eq 124 ]]; then
                 log ERROR "Server stop operation timed out after 3 minutes"
                 log ERROR "Attempting to force stop the server..."
                 
@@ -560,14 +562,14 @@ stop_server() {
                     log ERROR "Failed to force stop server"
                 fi
             else
-                log ERROR "Failed to stop server gracefully (exit code: $exit_code)"
+                log ERROR "Failed to stop server gracefully (exit code: $stop_exit_code)"
             fi
             
             # Check if server is still running after force stop attempt
             if is_server_running; then
                 log ERROR "Server is still running - this may prevent safe updating"
                 log ERROR "Manual intervention may be required"
-                exit 1
+                return 1
             else
                 log WARN "Server stopped (possibly forced), continuing with update"
             fi
@@ -786,7 +788,23 @@ main() {
     log DEBUG "Server running check completed, proceeding to stop server if needed..."
     
     # Stop server if running (only if update is needed)
+    # Temporarily disable ERR trap to handle stop_server failures gracefully
+    set +e
     stop_server
+    local stop_result=$?
+    set -e
+    
+    if [[ $stop_result -ne 0 ]]; then
+        log WARN "Stop server returned non-zero exit code ($stop_result), but continuing with update"
+        # Check if server actually stopped despite the error
+        if is_server_running; then
+            log ERROR "Server is still running after stop attempt failed"
+            log ERROR "Cannot safely proceed with update"
+            exit 1
+        else
+            log INFO "Server stopped despite error, proceeding with update"
+        fi
+    fi
     
     # Create backup (only if update is needed)
     backup_server
@@ -818,6 +836,7 @@ main() {
     notify_update_success "$installed_version" "$latest_version"
     
     # Restart server if it was running before
+    log DEBUG "Checking if server should be restarted... server_was_running=$server_was_running"
     if [[ "$server_was_running" == "true" ]]; then
         log INFO "Restarting server as it was running before the update..."
         start_server
