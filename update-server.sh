@@ -107,10 +107,18 @@ send_telegram_message() {
     # Prepare the API URL
     local api_url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    # Send message to each chat ID
-    local chat_ids_array=($TELEGRAM_CHAT_IDS)
+    # Send message to each chat ID - use read to safely handle the chat IDs
+    local chat_ids_array
+    read -ra chat_ids_array <<< "$TELEGRAM_CHAT_IDS"
     local success_count=0
     local total_count=${#chat_ids_array[@]}
+    
+    if [[ $total_count -eq 0 ]]; then
+        log WARN "No chat IDs configured for Telegram notifications"
+        return 1
+    fi
+    
+    log DEBUG "Sending to $total_count chat ID(s): ${chat_ids_array[*]}"
     
     for chat_id in "${chat_ids_array[@]}"; do
         log DEBUG "Sending message to chat ID: $chat_id"
@@ -151,17 +159,28 @@ send_telegram_message() {
 
 # Send update start notification
 notify_update_start() {
+    local current_version="${1:-$INSTALLED_VERSION}"
+    
     if [[ "$TELEGRAM_NOTIFY_UPDATE_START" == "true" ]]; then
+        log DEBUG "Preparing update start notification..."
         local hostname=$(hostname)
         local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         local message="🔄 *Minecraft Server Update Started*%0A%0A"
         message+="📅 Time: $timestamp%0A"
         message+="🖥️ Server: $hostname%0A"
-        message+="📦 Current version: $INSTALLED_VERSION%0A%0A"
+        message+="📦 Current version: $current_version%0A%0A"
         message+="⏳ Update is in progress..."
         
-        send_telegram_message "$message" "Markdown"
+        log DEBUG "Sending Telegram notification with message length: ${#message}"
+        if send_telegram_message "$message" "Markdown"; then
+            log DEBUG "Update start notification sent successfully"
+        else
+            log WARN "Failed to send update start notification, but continuing with update"
+        fi
+    else
+        log DEBUG "Update start notifications are disabled"
     fi
+    log DEBUG "notify_update_start function completed"
 }
 
 # Send update success notification
@@ -507,12 +526,51 @@ stop_server() {
     log DEBUG "Attempting to stop server..."
     if is_server_running; then
         log INFO "Stopping Minecraft server using stop-server.sh..."
-        if "$SCRIPT_DIR/stop-server.sh"; then
+        log DEBUG "This may take up to 2 minutes for graceful shutdown..."
+        
+        # Use timeout to prevent hanging indefinitely
+        # Allow up to 3 minutes (180 seconds) for graceful shutdown
+        if timeout 180 "$SCRIPT_DIR/stop-server.sh"; then
             log INFO "Server stopped successfully"
+            
+            # Double-check that the server actually stopped
+            local retry_count=0
+            while is_server_running && [[ $retry_count -lt 10 ]]; do
+                log DEBUG "Waiting for server to fully stop... (attempt $((retry_count + 1)))"
+                sleep 2
+                ((retry_count++))
+            done
+            
+            if is_server_running; then
+                log WARN "Server may not have stopped completely, but continuing with update"
+            else
+                log DEBUG "Server confirmed stopped"
+            fi
         else
-            log ERROR "Failed to stop server gracefully"
-            log ERROR "This may prevent the update from proceeding safely"
-            exit 1
+            local exit_code=$?
+            if [[ $exit_code -eq 124 ]]; then
+                log ERROR "Server stop operation timed out after 3 minutes"
+                log ERROR "Attempting to force stop the server..."
+                
+                # Try to force stop if graceful stop failed
+                if sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit 2>/dev/null; then
+                    log WARN "Server force-stopped using screen quit"
+                    sleep 5
+                else
+                    log ERROR "Failed to force stop server"
+                fi
+            else
+                log ERROR "Failed to stop server gracefully (exit code: $exit_code)"
+            fi
+            
+            # Check if server is still running after force stop attempt
+            if is_server_running; then
+                log ERROR "Server is still running - this may prevent safe updating"
+                log ERROR "Manual intervention may be required"
+                exit 1
+            else
+                log WARN "Server stopped (possibly forced), continuing with update"
+            fi
         fi
     else
         log INFO "Server is not running"
@@ -711,7 +769,7 @@ main() {
     
     # If we get here, an update is needed
     log INFO "Update required, proceeding with server update..."
-    notify_update_start
+    notify_update_start "$installed_version"
     
     log DEBUG "Starting update process after notification sent"
     
