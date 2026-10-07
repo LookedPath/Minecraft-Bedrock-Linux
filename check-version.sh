@@ -8,6 +8,11 @@ set -euo pipefail
 # Source configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
+CHECK_WORK_DIR=""
+cleanup_check() { [[ -z "$CHECK_WORK_DIR" ]] || rm -rf -- "$CHECK_WORK_DIR"; }
+trap cleanup_check EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Color codes for output
 RED='\033[0;31m'
@@ -74,8 +79,8 @@ get_installed_version() {
 
 # Get the latest available version
 get_latest_version() {
-    local temp_dir="/tmp/mc-version-check"
-    mkdir -p "$temp_dir"
+    CHECK_WORK_DIR=$(mktemp -d /tmp/mc-version-check.XXXXXXXX)
+    local temp_dir="$CHECK_WORK_DIR"
     
     log INFO "Checking for latest Minecraft Bedrock server version..."
     
@@ -297,8 +302,8 @@ main() {
     local latest_version="$LATEST_VERSION"
     
     # Compare versions
-    compare_versions "$installed_version" "$latest_version"
-    local comparison_result=$?
+    local comparison_result=0
+    compare_versions "$installed_version" "$latest_version" || comparison_result=$?
     
     # Show detailed info if requested
     if [[ "$show_detailed" == true && "$check_only" == false ]]; then

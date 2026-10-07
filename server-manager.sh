@@ -8,6 +8,8 @@ set -euo pipefail
 # Source configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
+source "$SCRIPT_DIR/common.sh"
+validate_config || { printf "%s\n" "Unsafe or invalid configuration" >&2; exit 1; }
 
 # Color codes for output
 RED='\033[0;31m'
@@ -34,21 +36,12 @@ log() {
 
 # Check if server is running
 is_server_running() {
-    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME"; then
-        return 0
-    else
-        return 1
-    fi
+    has_server_process || has_screen_session
 }
 
 # Get server process information
 get_server_process_info() {
-    local pid=$(pgrep -f "$SERVER_EXECUTABLE" 2>/dev/null || echo "")
-    if [[ -n "$pid" ]]; then
-        echo "$pid"
-    else
-        echo ""
-    fi
+    server_pids | head -1
 }
 
 # Show server status
@@ -232,7 +225,7 @@ send_command() {
     fi
     
     log INFO "Sending command to server: $command"
-    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "$command\n"
+    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "$command"$'\r'
 }
 
 # Show usage information

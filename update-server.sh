@@ -4,11 +4,21 @@
 # This script downloads the latest Minecraft Bedrock server, backs up the old installation,
 # and updates the server while preserving world data and configuration files.
 
-set -euo pipefail
+set -Eeuo pipefail
+umask 077
 
 # Source configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
+source "$SCRIPT_DIR/common.sh"
+
+WORK_DIR=""
+TRANSACTION_DIR=""
+SERVER_WAS_RUNNING=false
+STOP_ATTEMPTED=false
+UPDATE_COMMITTED=false
+NEW_PROMOTED=false
+BACKUP_FILE=""
 
 # Color codes for output
 RED='\033[0;31m'
@@ -50,7 +60,7 @@ check_requirements() {
     log DEBUG "Checking system requirements..."
     
     # Check for required commands
-    local required_commands=("wget" "unzip" "tar" "grep")
+    local required_commands=("wget" "tar" "grep" "python3" "realpath" "flock" "timeout" "sudo" "screen")
     for cmd in "${required_commands[@]}"; do
         if ! command -v "$cmd" &> /dev/null; then
             log ERROR "Required command not found: $cmd"
@@ -124,21 +134,20 @@ send_telegram_message() {
         log DEBUG "Sending message to chat ID: $chat_id"
         
         # Prepare POST data
-        local post_data="chat_id=${chat_id}&text=${message}"
-        if [[ -n "$parse_mode" ]]; then
-            post_data="${post_data}&parse_mode=${parse_mode}"
-        fi
+        local post_data
+        post_data=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.urlencode({"chat_id":sys.argv[1], "text":sys.argv[2].replace("%0A", "\n"), "parse_mode":sys.argv[3]}))' "$chat_id" "$message" "$parse_mode")
         
         # Send the message with timeout
-        local response=$(timeout 30 wget --timeout=15 --tries=2 \
+        local response
+        response=$(timeout 30 wget --timeout=15 --tries=2 \
             --post-data="$post_data" \
             --header="Content-Type: application/x-www-form-urlencoded" \
             --user-agent="$USER_AGENT" \
-            -q -O - "$api_url" 2>/dev/null)
+            -q -O - "$api_url" 2>/dev/null) || response=""
         
-        if [[ $? -eq 0 ]] && echo "$response" | grep -q '"ok":true'; then
+        if printf '%s\n' "$response" | grep -q '"ok":true'; then
             log DEBUG "Message sent successfully to chat ID: $chat_id"
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
             log WARN "Failed to send message to chat ID: $chat_id"
             log DEBUG "Response: $response"
@@ -249,17 +258,15 @@ notify_no_update() {
 
 # Create necessary directories
 setup_directories() {
-    log INFO "Setting up directories..."
-    
-    # Create directories with proper permissions
-    mkdir -p "$SERVER_DIR" "$BACKUP_DIR" "$TEMP_DIR" "$LOG_DIR"
-    
-    # Set ownership and permissions
-    chown -R "$SERVER_USER:$SERVER_USER" "$SERVER_DIR" "$BACKUP_DIR"
-    chmod 755 "$SERVER_DIR" "$BACKUP_DIR"
-    chmod 755 "$LOG_DIR"
-    
-    log INFO "Directories created and configured"
+    validate_config || { log ERROR "Unsafe or invalid configuration"; exit 1; }
+    id "$SERVER_USER" >/dev/null || { log ERROR "Run setup.sh first"; exit 1; }
+    acquire_management_lock || exit 1
+    mkdir -p -- "$(dirname "$SERVER_DIR")" "$BACKUP_DIR" "$LOG_DIR"
+    chown root:root "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    WORK_DIR=$(mktemp -d /tmp/minecraft-update.XXXXXXXX)
+    TEMP_DIR="$WORK_DIR"
+    log INFO "Created private update workspace"
 }
 
 # Get currently installed version
@@ -364,9 +371,9 @@ get_latest_download_url() {
             download_url=$(jq -r '.result.links[] | select(.downloadType=="serverBedrockLinux") | .downloadUrl' "$temp_json" 2>/dev/null || echo "")
             # Clean the URL and validate it
             download_url=$(echo "$download_url" | tr -d '\r\n' | sed 's/[[:space:]]*$//')
-            if [[ -n "$download_url" && "$download_url" != "null" && "$download_url" =~ ^https?:// ]]; then
+            if [[ -n "$download_url" && "$download_url" != "null" && "$download_url" =~ ^https:// ]]; then
                 # Extract version from the URL
-                latest_version=$(echo "$download_url" | grep -oP 'bedrock-server-\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null || echo "")
+                latest_version=$(echo "$download_url" | sed -nE 's/.*bedrock-server-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.zip$/\1/p' 2>/dev/null || echo "")
                 log INFO "Found latest version using jq: $latest_version"
             else
                 log DEBUG "Invalid or empty download URL from jq: '$download_url'"
@@ -382,9 +389,9 @@ get_latest_download_url() {
                 download_url=$(echo "$linux_entry" | sed 's/.*"downloadUrl":"//;s/".*//' 2>/dev/null || echo "")
                 # Clean the URL of any potential invisible characters
                 download_url=$(echo "$download_url" | tr -d '\r\n' | sed 's/[[:space:]]*$//')
-                if [[ -n "$download_url" && "$download_url" =~ ^https?:// ]]; then
+                if [[ -n "$download_url" && "$download_url" =~ ^https:// ]]; then
                     # Extract version from the URL
-                    latest_version=$(echo "$download_url" | grep -oP 'bedrock-server-\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null || echo "")
+                    latest_version=$(echo "$download_url" | sed -nE 's/.*bedrock-server-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.zip$/\1/p' 2>/dev/null || echo "")
                     log INFO "Found latest version using grep/sed: $latest_version"
                 else
                     log DEBUG "Invalid or empty download URL extracted: '$download_url'"
@@ -405,7 +412,7 @@ get_latest_download_url() {
         
         if timeout 30 wget --timeout=15 --tries=2 --user-agent="$USER_AGENT" -q -O "$temp_page" "https://www.minecraft.net/en-us/download/server/bedrock" 2>/dev/null; then
             # Extract version from the download link
-            latest_version=$(grep -oP 'bedrock-server-\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$temp_page" 2>/dev/null | head -1 || echo "")
+            latest_version=$(sed -nE 's/.*bedrock-server-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.zip$/\1/p' "$temp_page" 2>/dev/null | head -1 || echo "")
             
             if [[ -n "$latest_version" ]]; then
                 download_url="https://minecraft.azureedge.net/bin-linux/bedrock-server-${latest_version}.zip"
@@ -426,7 +433,7 @@ get_latest_download_url() {
         log INFO "Falling back to configured URL from config.sh"
         
         # Extract version from configured URL if possible
-        local config_version=$(echo "$DOWNLOAD_URL" | grep -oP 'bedrock-server-\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null || echo "unknown")
+        local config_version=$(echo "$DOWNLOAD_URL" | sed -nE 's/.*bedrock-server-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.zip$/\1/p' 2>/dev/null || echo "unknown")
         if [[ "$config_version" != "unknown" ]]; then
             log INFO "Using configured version: $config_version"
         fi
@@ -440,16 +447,20 @@ get_latest_download_url() {
         exit 1
     fi
     
+    [[ "$download_url" =~ ^https://[^[:space:]]+/bedrock-server-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.zip$ ]] || {
+        log ERROR "Invalid HTTPS download URL"; return 1;
+    }
+
     # Test the final URL with timeout
     log DEBUG "Validating download URL: $download_url"
     log DEBUG "URL length: ${#download_url} characters"
     log DEBUG "URL starts with: $(echo "$download_url" | head -c 50)..."
     
-    if ! timeout 15 wget --spider --timeout=10 --user-agent="$USER_AGENT" -q "$download_url" 2>/dev/null; then
+    if ! timeout 15 wget --https-only --spider --timeout=10 --user-agent="$USER_AGENT" -q "$download_url" 2>/dev/null; then
         log ERROR "Download URL is not accessible: $download_url"
         log ERROR "Please check your internet connection or update the URL manually in config.sh"
         log DEBUG "Trying wget with verbose output for debugging..."
-        timeout 15 wget --spider --timeout=10 --user-agent="$USER_AGENT" -v "$download_url" 2>&1 | head -5 || true
+        timeout 15 wget --https-only --spider --timeout=10 --user-agent="$USER_AGENT" -v "$download_url" 2>&1 | head -5 || true
         exit 1
     fi
     
@@ -465,260 +476,121 @@ get_latest_download_url() {
 # Download the latest server
 download_server() {
     local download_url="$1"
-    local filename="bedrock-server-latest.zip"
-    
-    log INFO "Downloading Minecraft Bedrock Server from: $download_url"
-    
-    cd "$TEMP_DIR"
-    
-    # Download with progress bar
-    if ! wget --progress=bar:force:noscroll --user-agent="$USER_AGENT" -O "$filename" "$download_url"; then
-        log ERROR "Failed to download server from $download_url"
-        notify_update_failure "Failed to download server from $download_url"
-        exit 1
-    fi
-    
-    log INFO "Download completed successfully"
-    DOWNLOADED_FILE="$TEMP_DIR/$filename"
+    # Reject plaintext HTTP and malformed URLs before invoking wget.
+    [[ "$download_url" =~ ^https://[^[:space:]]+/bedrock-server-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.zip$ ]] || {
+        log ERROR "Expected an HTTPS Bedrock server archive URL"; return 1;
+    }
+    log INFO "Downloading server update before shutdown..."
+    DOWNLOADED_FILE="$WORK_DIR/bedrock-server-latest.zip"
+    timeout 600 wget --https-only --timeout=30 --tries=3 --user-agent="$USER_AGENT" \
+        -O "$DOWNLOADED_FILE" -- "$download_url"
 }
 
 # Extract server files
 extract_server() {
-    local zip_file="$1"
-    local extract_dir="$TEMP_DIR/extracted"
-    
-    log INFO "Extracting server files..."
-    
-    mkdir -p "$extract_dir"
-    
-    if ! unzip -q "$zip_file" -d "$extract_dir"; then
-        log ERROR "Failed to extract server files"
-        exit 1
-    fi
-    
-    log INFO "Server files extracted successfully"
-    EXTRACTED_DIR="$extract_dir"
+    EXTRACTED_DIR="$WORK_DIR/extracted"
+    mkdir -- "$EXTRACTED_DIR"
+    python3 "$SCRIPT_DIR/validate-archive.py" "$1" "$EXTRACTED_DIR" \
+        "$SERVER_EXECUTABLE" "${MAX_EXTRACTED_BYTES:-4294967296}"
+    log INFO "Archive contents and executable validated"
 }
 
 # Check if server is running
 is_server_running() {
-    log DEBUG "Checking if server is running (user: $SERVER_USER, session: $SCREEN_SESSION_NAME)"
-    
-    # Check if the user exists
-    if ! id "$SERVER_USER" &>/dev/null; then
-        log DEBUG "User $SERVER_USER does not exist"
-        return 1
-    fi
-    
-    # Check if screen command is available
-    if ! command -v screen &>/dev/null; then
-        log DEBUG "Screen command not available"
-        return 1
-    fi
-    
-    # Use a more robust approach to check for running screen sessions
-    local screen_output=""
-    if screen_output=$(sudo -u "$SERVER_USER" screen -list 2>/dev/null); then
-        log DEBUG "Screen list output: $screen_output"
-        if echo "$screen_output" | grep -q "$SCREEN_SESSION_NAME"; then
-            log DEBUG "Server screen session found"
-            return 0
-        else
-            log DEBUG "Server screen session not found"
-            return 1
-        fi
-    else
-        log DEBUG "Failed to get screen list or no screen sessions found"
-        return 1
-    fi
+    # A process without its console still prevents a safe update.
+    has_server_process || has_screen_session
 }
 
 # Stop the server gracefully using the stop-server script
 stop_server() {
-    log DEBUG "Attempting to stop server..."
     if is_server_running; then
-        log INFO "Stopping Minecraft server using stop-server.sh..."
-        log DEBUG "This may take up to 2 minutes for graceful shutdown..."
-        
-        # Use timeout to prevent hanging indefinitely
-        # Allow up to 3 minutes (180 seconds) for graceful shutdown
-        local stop_exit_code=0
-        timeout 180 "$SCRIPT_DIR/stop-server.sh" || stop_exit_code=$?
-        
-        if [[ $stop_exit_code -eq 0 ]]; then
-            log INFO "Server stopped successfully"
-            
-            # Double-check that the server actually stopped
-            local retry_count=0
-            while is_server_running && [[ $retry_count -lt 10 ]]; do
-                log DEBUG "Waiting for server to fully stop... (attempt $((retry_count + 1)))"
-                sleep 2
-                ((retry_count++))
-            done
-            
-            if is_server_running; then
-                log WARN "Server may not have stopped completely, but continuing with update"
-            else
-                log DEBUG "Server confirmed stopped"
-            fi
-        else
-            if [[ $stop_exit_code -eq 124 ]]; then
-                log ERROR "Server stop operation timed out after 3 minutes"
-                log ERROR "Attempting to force stop the server..."
-                
-                # Try to force stop if graceful stop failed
-                if sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit 2>/dev/null; then
-                    log WARN "Server force-stopped using screen quit"
-                    sleep 5
-                else
-                    log ERROR "Failed to force stop server"
-                fi
-            else
-                log ERROR "Failed to stop server gracefully (exit code: $stop_exit_code)"
-            fi
-            
-            # Check if server is still running after force stop attempt
-            if is_server_running; then
-                log ERROR "Server is still running - this may prevent safe updating"
-                log ERROR "Manual intervention may be required"
-                return 1
-            else
-                log WARN "Server stopped (possibly forced), continuing with update"
-            fi
-        fi
-    else
-        log INFO "Server is not running"
+        log INFO "Stopping server before backup..."
+        timeout 180 "$SCRIPT_DIR/stop-server.sh" || return 1
+    fi
+    if is_server_running; then
+        log ERROR "Server has not stopped; refusing to update"
+        return 1
     fi
 }
 
 # Start the server using the start-server script
 start_server() {
-    log INFO "Starting Minecraft server using start-server.sh..."
-    if "$SCRIPT_DIR/start-server.sh"; then
-        log INFO "Server started successfully"
-    else
-        log ERROR "Failed to start server"
-        log ERROR "You may need to start it manually using: $SCRIPT_DIR/start-server.sh"
-    fi
+    "$SCRIPT_DIR/start-server.sh"
 }
 
 # Create backup of current server
 backup_server() {
-    if [[ ! -d "$SERVER_DIR" ]]; then
-        log INFO "No existing server directory found, skipping backup"
-        return 0
-    fi
-    
-    local backup_name="minecraft-backup-$(date +%Y%m%d-%H%M%S)"
-    local backup_path="$BACKUP_DIR/$backup_name"
-    
-    log INFO "Creating backup: $backup_name"
-    
-    # Create backup directory
-    mkdir -p "$backup_path"
-    
-    # Copy server files (preserve permissions and timestamps)
-    if ! cp -rp "$SERVER_DIR"/* "$backup_path/"; then
-        log ERROR "Failed to create backup"
-        exit 1
-    fi
-    
-    # Compress backup
-    log INFO "Compressing backup..."
-    cd "$BACKUP_DIR"
-    if ! tar -czf "$backup_name.tar.gz" "$backup_name"; then
-        log ERROR "Failed to compress backup"
-        exit 1
-    fi
-    
-    # Remove uncompressed backup
-    rm -rf "$backup_path"
-    
-    # Set ownership
-    chown "$SERVER_USER:$SERVER_USER" "$backup_name.tar.gz"
-    
-    log INFO "Backup created successfully: $backup_name.tar.gz"
+    [[ -d "$SERVER_DIR" ]] || return 0
+    BACKUP_FILE=$(mktemp "$BACKUP_DIR/minecraft-backup-$(date +%Y%m%d-%H%M%S)-XXXXXXXX.tar.gz")
+    # Include dotfiles and preserve metadata. Publish only a complete, readable archive.
+    local partial="$BACKUP_FILE.partial"
+    rm -- "$BACKUP_FILE"
+    tar -czf "$partial" -C "$(dirname "$SERVER_DIR")" -- "$(basename "$SERVER_DIR")"
+    tar -tzf "$partial" >/dev/null
+    mv -- "$partial" "$BACKUP_FILE"
+    chmod 600 "$BACKUP_FILE"
+    log INFO "Complete backup created: $BACKUP_FILE"
 }
 
 # Clean old backups
 cleanup_old_backups() {
-    log INFO "Cleaning up old backups (older than $BACKUP_RETENTION_DAYS days)..."
-    
-    find "$BACKUP_DIR" -name "minecraft-backup-*.tar.gz" -type f -mtime +$BACKUP_RETENTION_DAYS -delete
-    
-    log INFO "Old backups cleaned up"
+    # Never expire the backup created by this update.
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'minecraft-backup-*.tar.gz' \
+        ! -path "$BACKUP_FILE" -mtime "+$BACKUP_RETENTION_DAYS" -delete
 }
 
 # Preserve important files during update
 preserve_files() {
-    local extract_dir="$1"
-    local preserve_dir="$TEMP_DIR/preserve"
-    
-    log INFO "Preserving configuration files and world data..."
-    
-    mkdir -p "$preserve_dir"
-    
-    # Preserve configuration files
-    for file in "${PRESERVE_FILES[@]}"; do
-        if [[ -f "$SERVER_DIR/$file" ]]; then
-            cp "$SERVER_DIR/$file" "$preserve_dir/"
-            log DEBUG "Preserved: $file"
+    PRESERVED_DIR="$WORK_DIR/preserve"
+    mkdir -- "$PRESERVED_DIR"
+    local entry
+    for entry in "${PRESERVE_FILES[@]}" "${WORLD_DIRS[@]}"; do
+        if [[ -e "$SERVER_DIR/$entry" || -L "$SERVER_DIR/$entry" ]]; then
+            cp -a -- "$SERVER_DIR/$entry" "$PRESERVED_DIR/"
         fi
     done
-    
-    # Preserve world directories
-    for dir in "${WORLD_DIRS[@]}"; do
-        if [[ -d "$SERVER_DIR/$dir" ]]; then
-            cp -r "$SERVER_DIR/$dir" "$preserve_dir/"
-            log DEBUG "Preserved: $dir"
-        fi
-    done
-    
-    PRESERVED_DIR="$preserve_dir"
 }
 
 # Install new server
 install_server() {
-    local extract_dir="$1"
-    local preserve_dir="$2"
-    
-    log INFO "Installing new server files..."
-    
-    # Remove old server files (but keep directory structure)
+    local extract_dir="$1" preserve_dir="$2" entry
+    TRANSACTION_DIR=$(mktemp -d "$(dirname "$SERVER_DIR")/.minecraft-install.XXXXXXXX")
+    local stage="$TRANSACTION_DIR/new"
+    mkdir -- "$stage"
+    cp -a -- "$extract_dir/." "$stage/"
+    # Replace preserved directories instead of merging with new defaults.
+    for entry in "${PRESERVE_FILES[@]}" "${WORLD_DIRS[@]}"; do
+        if [[ -e "$preserve_dir/$entry" || -L "$preserve_dir/$entry" ]]; then
+            rm -rf -- "$stage/$entry"
+            cp -a -- "$preserve_dir/$entry" "$stage/"
+        fi
+    done
+    # Reject symlinks in preserved data before root chmod/chown operations.
+    if [[ -n "$(find "$stage" -type l -print -quit)" ]]; then
+        log ERROR "Symlinks in preserved data require manual review"; return 1
+    fi
+    store_version_info "$stage"
+    chmod +x "$stage/$SERVER_EXECUTABLE"
+    chown -R "$SERVER_USER:$SERVER_USER" "$stage"
+    chmod 750 "$stage"
+    # Both renames remain on the same filesystem. Keep old files until startup passes.
     if [[ -d "$SERVER_DIR" ]]; then
-        find "$SERVER_DIR" -mindepth 1 -delete
+        mv -- "$SERVER_DIR" "$TRANSACTION_DIR/old"
     fi
-    
-    # Copy new server files
-    cp -r "$extract_dir"/* "$SERVER_DIR/"
-    
-    # Restore preserved files
-    if [[ -d "$preserve_dir" ]]; then
-        cp -r "$preserve_dir"/* "$SERVER_DIR/"
-        log INFO "Restored preserved files and world data"
-    fi
-    
-    # Store version information for future reference
-    store_version_info
-    
-    # Set executable permissions on server binary
-    chmod +x "$SERVER_DIR/$SERVER_EXECUTABLE"
-    
-    # Set ownership
-    chown -R "$SERVER_USER:$SERVER_USER" "$SERVER_DIR"
-    
-    log INFO "New server installed successfully"
+    NEW_PROMOTED=true
+    mv -- "$stage" "$SERVER_DIR"
+    log INFO "Replacement installed; previous installation retained until verification"
 }
 
 # Store version information to a file for future reference
 store_version_info() {
-    local version_file="$SERVER_DIR/.installed_version"
+    local version_file="${1:-$SERVER_DIR}/.installed_version"
     local install_date=$(date '+%Y-%m-%d %H:%M:%S')
     
     # Extract version from the download URL if possible
     local installed_version=""
     if [[ -n "$DETECTED_DOWNLOAD_URL" ]]; then
-        installed_version=$(echo "$DETECTED_DOWNLOAD_URL" | grep -oP 'bedrock-server-\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null || echo "")
+        installed_version=$(echo "$DETECTED_DOWNLOAD_URL" | sed -nE 's/.*bedrock-server-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.zip$/\1/p' 2>/dev/null || echo "")
     fi
     
     if [[ -z "$installed_version" ]]; then
@@ -743,151 +615,87 @@ EOF
 
 # Cleanup temporary files
 cleanup_temp() {
-    if [[ -d "$TEMP_DIR" ]]; then
-        log INFO "Cleaning up temporary files..."
-        rm -rf "$TEMP_DIR"
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+        rm -rf -- "$WORK_DIR"
     fi
 }
 
 # Main update process
 main() {
-    log INFO "Starting Minecraft Bedrock Server update process..."
-    
-    # Check prerequisites
+    validate_config || { printf "%s\n" "Unsafe or invalid configuration" >&2; exit 1; }
     check_root
     check_requirements
-    
-    # Setup directories
     setup_directories
-    
-    # Get current and latest versions first
-    log INFO "Checking current installation and available updates..."
     get_installed_version
     local installed_version="$INSTALLED_VERSION"
-    
     get_latest_download_url
-    local download_url="$DETECTED_DOWNLOAD_URL"
-    
-    # Extract latest version from download URL
-    local latest_version=""
-    if [[ -n "$download_url" ]]; then
-        latest_version=$(echo "$download_url" | grep -oP 'bedrock-server-\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null || echo "unknown")
-    else
-        latest_version="unknown"
-    fi
-    
-    # Check if update is actually needed
+    local download_url="$DETECTED_DOWNLOAD_URL" latest_version
+    latest_version=$(printf '%s\n' "$download_url" | sed -nE 's/.*bedrock-server-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.zip$/\1/p')
+    [[ -n "$latest_version" ]] || { log ERROR "Cannot determine target version"; exit 1; }
     if ! check_update_needed "$installed_version" "$latest_version"; then
-        log INFO "No update required. Exiting."
         notify_no_update "$installed_version"
-        exit 0
+        return 0
     fi
-    
-    # If we get here, an update is needed
-    log INFO "Update required, proceeding with server update..."
     notify_update_start "$installed_version"
-    
-    log DEBUG "Starting update process after notification sent"
-    
-    # Check if server is currently running (only now that we know we need to update)
-    log DEBUG "About to check if server is running..."
-    local server_was_running=false
-    if is_server_running; then
-        server_was_running=true
-        log INFO "Server is currently running and will be restarted after update"
-    else
-        log INFO "Server is not currently running"
-    fi
-    
-    log DEBUG "Server running check completed, proceeding to stop server if needed..."
-    
-    # Stop server if running (only if update is needed)
-    # Temporarily disable ERR trap to handle stop_server failures gracefully
-    set +e
+    download_server "$download_url"
+    extract_server "$DOWNLOADED_FILE"
+    if is_server_running; then SERVER_WAS_RUNNING=true; fi
+    STOP_ATTEMPTED=true
     stop_server
-    local stop_result=$?
-    set -e
-    
-    if [[ $stop_result -ne 0 ]]; then
-        log WARN "Stop server returned non-zero exit code ($stop_result), but continuing with update"
-        # Check if server actually stopped despite the error
-        if is_server_running; then
-            log ERROR "Server is still running after stop attempt failed"
-            log ERROR "Cannot safely proceed with update"
-            exit 1
+    backup_server
+    preserve_files "$EXTRACTED_DIR"
+    install_server "$EXTRACTED_DIR" "$PRESERVED_DIR"
+    if [[ "$SERVER_WAS_RUNNING" == true ]]; then
+        start_server
+    fi
+    UPDATE_COMMITTED=true
+    cleanup_old_backups || log WARN "Update committed, but backup retention cleanup failed"
+    log INFO "Update completed: $installed_version → $latest_version"
+    notify_update_success "$installed_version" "$latest_version"
+}
+
+# EXIT runs for explicit exits and errors; signals use conventional failure statuses.
+finish_update() {
+    local status=$? recovery_failed=false
+    trap - EXIT ERR INT TERM
+    set +e
+    if [[ "$status" -ne 0 && "$UPDATE_COMMITTED" != true ]]; then
+        log ERROR "Update failed (exit $status); recovering previous installation"
+        if [[ -n "$TRANSACTION_DIR" && -d "$TRANSACTION_DIR/old" ]] || [[ "$NEW_PROMOTED" == true ]]; then
+            if is_server_running; then
+                timeout 180 "$SCRIPT_DIR/stop-server.sh" --force
+            fi
+            if is_server_running; then
+                recovery_failed=true
+                log ERROR "Cannot stop replacement; retained recovery files: $TRANSACTION_DIR"
+            else
+                if [[ "$NEW_PROMOTED" == true && -d "$SERVER_DIR" ]]; then
+                    mv -- "$SERVER_DIR" "$TRANSACTION_DIR/failed" || recovery_failed=true
+                fi
+                if [[ "$recovery_failed" == false && -d "$TRANSACTION_DIR/old" ]]; then
+                    mv -- "$TRANSACTION_DIR/old" "$SERVER_DIR" || recovery_failed=true
+                fi
+            fi
+        fi
+        if [[ "$recovery_failed" == false && "$SERVER_WAS_RUNNING" == true && "$STOP_ATTEMPTED" == true ]]; then
+            if ! is_server_running; then
+                start_server || { recovery_failed=true; log ERROR "Previous server could not restart; backup: $BACKUP_FILE"; }
+            fi
+        fi
+        notify_update_failure "Update failed (exit $status). Recovery files: ${TRANSACTION_DIR:-none}; backup: ${BACKUP_FILE:-none}. Check logs."
+    fi
+    cleanup_temp
+    if [[ -n "$TRANSACTION_DIR" && -d "$TRANSACTION_DIR" ]]; then
+        if [[ "$UPDATE_COMMITTED" == true || ( "$status" -eq 0 && "$recovery_failed" == false ) ]]; then
+            rm -rf -- "$TRANSACTION_DIR"
         else
-            log INFO "Server stopped despite error, proceeding with update"
+            log WARN "Retained transaction files for inspection: $TRANSACTION_DIR"
         fi
     fi
-    
-    # Create backup (only if update is needed)
-    backup_server
-    
-    # Download latest server
-    log INFO "Downloading server update..."
-    download_server "$download_url"
-    local zip_file="$DOWNLOADED_FILE"
-    
-    # Extract server
-    extract_server "$zip_file"
-    local extract_dir="$EXTRACTED_DIR"
-    
-    # Preserve important files
-    preserve_files "$extract_dir"
-    local preserve_dir="$PRESERVED_DIR"
-    
-    # Install new server
-    install_server "$extract_dir" "$preserve_dir"
-    
-    # Cleanup (but keep temp dir for now in case restart fails)
-    cleanup_old_backups
-    
-    log INFO "Minecraft Bedrock Server update completed successfully!"
-    log INFO "Updated from version $installed_version to $latest_version"
-    
-    # Send success notification
-    notify_update_success "$installed_version" "$latest_version"
-    
-    # Restart server if it was running before
-    log DEBUG "Checking if server should be restarted... server_was_running=$server_was_running"
-    if [[ "$server_was_running" == "true" ]]; then
-        log INFO "Restarting server as it was running before the update..."
-        start_server
-    else
-        log INFO "Server was not running before update, leaving it stopped"
-        log INFO "You can start the server using: $SCRIPT_DIR/start-server.sh"
-    fi
-    
-    # Final cleanup
-    cleanup_temp
+    exit "$status"
 }
 
-# Handle script interruption
-cleanup_and_notify_error() {
-    local exit_code=$?
-    local line_number=${1:-"unknown"}
-    
-    log ERROR "Script interrupted or failed at line $line_number with exit code $exit_code"
-    log ERROR "This may have occurred during: server status check, server stop, backup, download, or installation"
-    log DEBUG "Call stack: ${BASH_SOURCE[*]}"
-    log DEBUG "Function stack: ${FUNCNAME[*]}"
-    
-    # Cleanup and disable the EXIT trap to prevent double cleanup
-    trap - EXIT
-    cleanup_temp
-    
-    if [[ $exit_code -ne 0 ]]; then
-        local error_msg="Script failed at line $line_number with exit code $exit_code. Check logs for details."
-        log ERROR "$error_msg"
-        notify_update_failure "$error_msg"
-    fi
-    
-    exit $exit_code
-}
-
-# Set up error handling
-trap 'cleanup_and_notify_error $LINENO' ERR
-# Note: EXIT trap removed to prevent interference with normal script completion
-
-# Run main function
+trap finish_update EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 main "$@"

@@ -8,6 +8,21 @@ set -euo pipefail
 # Source configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
+source "$SCRIPT_DIR/common.sh"
+validate_config || { printf "%s\n" "Unsafe or invalid configuration" >&2; exit 1; }
+
+SAVE_HELD=false
+release_save_hold() {
+    local status=$?
+    trap - EXIT INT TERM
+    if [[ "$SAVE_HELD" == true ]]; then
+        sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "save resume"$'\r' || true
+    fi
+    exit "$status"
+}
+trap release_save_hold EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Color codes for output
 RED='\033[0;31m'
@@ -38,33 +53,7 @@ log() {
 
 # Check if server is running
 is_server_running() {
-    local screen_running=false
-    local process_running=false
-    
-    # First check if screen session exists
-    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
-        screen_running=true
-    fi
-    
-    # Then check if the bedrock_server process is actually running
-    # Use multiple methods to be more reliable
-    if sudo -u "$SERVER_USER" pgrep -x "$SERVER_EXECUTABLE" >/dev/null 2>&1; then
-        process_running=true
-    elif sudo -u "$SERVER_USER" pgrep -f "\./$SERVER_EXECUTABLE" >/dev/null 2>&1; then
-        process_running=true
-    elif sudo -u "$SERVER_USER" ps aux | grep -v grep | grep -q "$SERVER_EXECUTABLE"; then
-        process_running=true
-    fi
-    
-    # Debug output (uncomment for troubleshooting)
-    log DEBUG "Screen session running: $screen_running, Process running: $process_running"
-    
-    # Server is considered running if BOTH screen session exists AND process is running
-    if [[ "$screen_running" == true && "$process_running" == true ]]; then
-        return 0
-    else
-        return 1
-    fi
+    has_server_process || has_screen_session
 }
 
 # Send a message to all players before shutdown
@@ -76,7 +65,7 @@ send_shutdown_warning() {
     local message="Server will shut down in $countdown seconds. Please save your progress!"
     
     # Send the message to the server console
-    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "say $message\n" || {
+    sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "say $message"$'\r' || {
         log WARN "Failed to send shutdown warning"
         return 1
     }
@@ -87,7 +76,7 @@ send_server_command() {
     local command="$1"
     
     if is_server_running; then
-        sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "$command\n" || {
+        sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X stuff "$command"$'\r' || {
             log ERROR "Failed to send command: $command"
             return 1
         }
@@ -129,11 +118,12 @@ graceful_stop() {
     if is_server_running; then
         # Save the world before stopping
         log INFO "Saving world data..."
+        SAVE_HELD=true
         send_server_command "save hold" || log WARN "Failed to send 'save hold' command"
         sleep 2
         send_server_command "save query" || log WARN "Failed to send 'save query' command"
         sleep 3
-        send_server_command "save resume" || log WARN "Failed to send 'save resume' command"
+        if send_server_command "save resume"; then SAVE_HELD=false; fi
         sleep 2
         
         # Send stop command
@@ -163,7 +153,7 @@ graceful_stop() {
             fi
             
             sleep 1
-            ((count++))
+            count=$((count + 1))
             
             # Show progress every 10 seconds
             if [[ $((count % 10)) -eq 0 ]]; then
@@ -174,12 +164,11 @@ graceful_stop() {
                     local screen_status="not found"
                     local process_status="not found"
                     
-                    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
+                    if has_screen_session; then
                         screen_status="running"
                     fi
                     
-                    if sudo -u "$SERVER_USER" pgrep -x "$SERVER_EXECUTABLE" >/dev/null 2>&1 || \
-                       sudo -u "$SERVER_USER" pgrep -f "\./$SERVER_EXECUTABLE" >/dev/null 2>&1; then
+                    if has_server_process; then
                         process_status="running"
                     fi
                     
@@ -197,9 +186,9 @@ graceful_stop() {
             sleep 2
             
             # Also kill any remaining bedrock_server processes
-            if sudo -u "$SERVER_USER" pgrep -f "$SERVER_EXECUTABLE" >/dev/null 2>&1; then
+            if has_server_process; then
                 log WARN "Killing remaining bedrock_server processes..."
-                sudo -u "$SERVER_USER" pkill -f "$SERVER_EXECUTABLE" || {
+                signal_server TERM || {
                     log ERROR "Failed to kill bedrock_server processes"
                     return 1
                 }
@@ -215,7 +204,7 @@ graceful_stop() {
         else
             log INFO "Server stopped gracefully"
             # Clean up any lingering screen session
-            if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
+            if has_screen_session; then
                 log INFO "Cleaning up screen session..."
                 sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || true
             fi
@@ -227,42 +216,22 @@ graceful_stop() {
 
 # Force stop the server (immediate)
 force_stop() {
-    if ! is_server_running; then
-        log INFO "Server is not running"
-        return 0
-    fi
-    
-    log WARN "Force stopping Minecraft Bedrock Server..."
-    
-    # First try to kill the bedrock_server process
-    if sudo -u "$SERVER_USER" pgrep -f "$SERVER_EXECUTABLE" >/dev/null 2>&1; then
-        log INFO "Killing bedrock_server processes..."
-        sudo -u "$SERVER_USER" pkill -f "$SERVER_EXECUTABLE" || {
-            log WARN "Failed to kill bedrock_server processes gracefully, trying with SIGKILL..."
-            sudo -u "$SERVER_USER" pkill -9 -f "$SERVER_EXECUTABLE" || {
-                log ERROR "Failed to kill bedrock_server processes"
-            }
-        }
+    log WARN "Force stopping configured server instance..."
+    signal_server TERM || return 1
+    local count
+    for ((count=0; count<10; count++)); do
+        has_server_process || break
+        sleep 1
+    done
+    if has_server_process; then
+        signal_server KILL || return 1
         sleep 2
     fi
-    
-    # Then kill the screen session
-    if sudo -u "$SERVER_USER" screen -list | grep -q "$SCREEN_SESSION_NAME" 2>/dev/null; then
-        log INFO "Killing screen session..."
-        sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || {
-            log WARN "Failed to kill screen session gracefully"
-        }
-        sleep 2
+    if has_screen_session; then
+        sudo -u "$SERVER_USER" screen -S "$SCREEN_SESSION_NAME" -X quit || return 1
+        sleep 1
     fi
-    
-    if is_server_running; then
-        log ERROR "Failed to force stop server"
-        return 1
-    else
-        log INFO "Server stopped forcefully"
-    fi
-    
-    return 0
+    ! is_server_running
 }
 
 # Show server status
@@ -334,6 +303,10 @@ main() {
             show_status
             ;;
         "stop")
+            if [[ $EUID -ne 0 ]]; then
+                log ERROR "Run stop-server.sh as root"; return 1
+            fi
+            acquire_management_lock
             if [[ "$force_mode" == "force" ]]; then
                 force_stop
             else

@@ -1,0 +1,16 @@
+name: Shell and recovery checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: |
+          for script in *.sh; do bash -n "$script" || exit 1; done
+      - name: Run isolated hardening regressions
+        run: python3 -m unittest discover -s tests -v

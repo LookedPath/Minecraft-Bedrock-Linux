@@ -5,13 +5,12 @@ This collection of bash scripts provides comprehensive management for a Minecraf
 ## Features
 
 - **Automated Updates**: Download and install the latest Minecraft Bedrock server
-- **Backup System**: Automatic backups before updates with configurable retention
+- **Backup System**: Complete backups, including hidden files, before updates with configurable retention
+- **Recoverable Updates**: Private staging, serialized management operations, archive validation, and rollback after failed startup
 - **Screen Management**: Server runs in a screen session accessible by both `mcserver` user and root
 - **Graceful Shutdown**: Player warnings before server stops
 - **Configuration Preservation**: Keeps server settings and world data during updates
 - **System Integration**: Optional systemd service and firewall configuration
-
-## Scripts Overview
 
 ## Scripts Overview
 
@@ -21,7 +20,7 @@ Initial setup script that prepares the environment:
 
 - Creates the `mcserver` user
 - Sets up directories with proper permissions
-- Configures screen for multi-user access
+- Uses the distribution-managed Screen socket permissions
 - Creates systemd service
 - Sets up firewall rules (if UFW is available)
 - Creates helpful command aliases
@@ -41,10 +40,12 @@ Downloads and installs the latest Minecraft Bedrock server:
 
 - **Automatically detects the latest version** from minecraft.net
 - Falls back to configured URL if detection fails
-- Downloads the latest server version
+- Downloads and validates the archive before stopping the server
 - Creates backups before updating
 - Preserves world data and configuration files
 - Gracefully stops/starts the server
+- Keeps the previous installation until startup verification passes
+- Rolls back failures and retains transaction files for inspection
 - Cleans up old backups
 
 ### `check-version.sh`
@@ -62,7 +63,7 @@ Starts the Minecraft server in a screen session:
 
 - Checks for existing running instances
 - Starts server as `mcserver` user
-- Creates screen session accessible by root
+- Creates a screen session root can access with `sudo -u mcserver`
 - Provides connection instructions
 
 ### `stop-server.sh`
@@ -100,7 +101,7 @@ Comprehensive management interface:
 3. **Run the setup script as root**:
 
    ```bash
-   sudo ./setup.sh
+   sudo bash ./setup.sh --install-dependencies
    ```
 
 4. **Download and install the server**:
@@ -111,8 +112,64 @@ Comprehensive management interface:
 
 5. **Start the server**:
    ```bash
-   ./start-server.sh
+   sudo ./start-server.sh
    ```
+
+## Upgrading an existing installation
+
+For servers installed with an older version of these scripts, use the compatibility
+upgrade instead of rerunning the full setup:
+
+1. Arrange a maintenance window. Pause automatic update jobs and stop the server
+   with the **old scripts** before replacing them. If systemd manages the server,
+   use `sudo systemctl stop minecraft-bedrock` so it stays stopped.
+2. Save your customized `config.sh`, deploy all files from this release (including
+   `common.sh`, `validate-archive.py`, and `migrate-settings.py`) in the same scripts
+   directory, then restore your configuration. Keep existing paths and credentials.
+3. Run the upgrade from that directory:
+
+   ```bash
+   sudo bash ./setup.sh --upgrade --install-dependencies
+   ```
+
+   This installs required packages using apt, dnf, yum, pacman, or zypper. Package
+   installation is optional: if the dependencies are already installed, run
+   `sudo bash ./setup.sh --upgrade`. On other distributions, install Python 3,
+   GNU coreutils and util-linux manually first, alongside the existing requirements.
+4. Reload aliases with `source /etc/profile.d/minecraft.sh`. Start with
+   `sudo systemctl start minecraft-bedrock` when using systemd, or
+   `sudo ./start-server.sh` otherwise. Restore your automatic update schedule.
+
+The upgrade can be run repeatedly. It creates the shared management lock,
+reapplies the distribution's Screen runtime permissions, repairs the configured
+user's private Screen socket directory, disables legacy `multiuser on` and
+`acladd root` settings, and adds `sudo` to the existing start/stop/restart aliases.
+Custom Screen settings and unrelated aliases are preserved. Modified settings
+files get a one-time `.pre-hardening` backup. Existing backup archives become
+root-owned with mode 600 and the backup directory uses mode 700.
+
+Server binaries, worlds, `config.sh`, cron jobs, systemd unit overrides, and
+firewall rules are preserved. The migration refuses to run while the server or
+its Screen session is running. It does not download or update Minecraft.
+Older configuration files remain supported: `MAX_EXTRACTED_BYTES` defaults to
+4 GiB if absent, and the legacy `TEMP_DIR` value is ignored by the updater.
+
+A read-only prerequisite check is also available:
+
+```bash
+sudo bash ./setup.sh --check
+```
+
+This checks dependencies and configuration; it does not apply migration changes
+or certify that the Screen runtime permissions have already been repaired.
+If a dependency is missing, it prints the compatibility upgrade command.
+
+Screen repair uses the distribution's existing tmpfiles policy via
+`systemd-tmpfiles --create --prefix=/run/screen`. It does not delete sockets.
+If the old world-writable permissions remain or the runtime directory is missing,
+the upgrade stops and gives package-reinstallation instructions. Reinstall the
+Screen package (for example, `sudo apt-get install --reinstall screen` on
+Debian/Ubuntu) and rerun the upgrade. It will not guess shared directory permissions.
 
 ## Configuration
 
@@ -122,7 +179,7 @@ Edit `config.sh` to customize:
 # Server configuration
 SERVER_USER="mcserver"                          # User to run the server
 SERVER_DIR="/home/mcserver/minecraft-server"    # Server installation directory
-BACKUP_DIR="/home/mcserver/backups"             # Backup storage directory
+BACKUP_DIR="/home/mcserver/backups"             # Root-controlled backup directory
 SCREEN_SESSION_NAME="minecraft-server"          # Screen session name
 
 # Download URL (update this for newer versions)
@@ -256,17 +313,17 @@ tail -f /var/log/minecraft/minecraft-server.log
 ### Starting the Server
 
 ```bash
-./start-server.sh
+sudo ./start-server.sh
 ```
 
 ### Stopping the Server
 
 ```bash
 # Graceful stop (with player warnings)
-./stop-server.sh
+sudo ./stop-server.sh
 
 # Force stop (immediate)
-./stop-server.sh --force
+sudo ./stop-server.sh --force
 
 # Check status only
 ./stop-server.sh --status
@@ -295,9 +352,9 @@ sudo -u mcserver screen -r minecraft-server
 ./server-manager.sh command "say Hello players!"
 
 # Quick start/stop/restart
-./server-manager.sh start
-./server-manager.sh stop
-./server-manager.sh restart
+sudo ./server-manager.sh start
+sudo ./server-manager.sh stop
+sudo ./server-manager.sh restart
 ```
 
 ### Updating the Server
@@ -321,11 +378,7 @@ sudo ./update-server.sh
 
 ## Automatic Version Detection
 
-The update script now automatically detects the latest Minecraft Bedrock server version using multiple methods:
-
-1. **Official Website Scraping**: Downloads the Minecraft server page and extracts the latest version number
-2. **Azure CDN Testing**: Tests likely version patterns against the download server
-3. **Fallback URL**: Uses the configured URL from `config.sh` if automatic detection fails
+The updater attempts the official Minecraft download-links API, then website scraping, then the configured fallback URL. Keep the fallback URL current; it does not establish what the latest release is. Downloads must use HTTPS.
 
 The system validates all URLs before attempting downloads and provides clear error messages if detection fails.
 
@@ -339,7 +392,7 @@ The server runs in a screen session that can be accessed by both the `mcserver` 
 
 ### Multi-user Screen Access
 
-The screen configuration allows root to attach to the `mcserver` user's screen session:
+Root attaches by running Screen as the server user. Multiuser Screen mode is disabled, and the scripts leave shared socket-directory permissions to the distribution:
 
 ```bash
 # As mcserver user
@@ -369,15 +422,19 @@ sudo systemctl status minecraft-bedrock
 
 Backups are automatically created before each update:
 
-- **Location**: `$BACKUP_DIR/minecraft-backup-YYYYMMDD-HHMMSS.tar.gz`
+- **Location**: `$BACKUP_DIR/minecraft-backup-YYYYMMDD-HHMMSS-RANDOM.tar.gz`
 - **Retention**: Configurable in `config.sh` (default: 30 days)
-- **Contents**: Complete server directory including worlds and configuration
+- **Contents**: Complete server directory including hidden files, worlds, and configuration
+- **Permissions**: Root owns the backup directory; archives use mode 600
+- **Retention safety**: The backup created by the current update is never expired during that update
 
 ### Manual Backup
 
 ```bash
-# Force an update (which creates a backup)
-sudo ./update-server.sh
+# Stop before archiving so the world is consistent
+sudo ./stop-server.sh
+sudo tar -czf /path/to/backup.tar.gz -C /home/mcserver minecraft-server
+sudo ./start-server.sh
 ```
 
 ## File Structure
@@ -480,10 +537,10 @@ Update the `DOWNLOAD_URL` in `config.sh` when new server versions are released.
 
 ### Custom Backup Schedule
 
-Add a cron job to run backups periodically:
+The updater creates a backup only when an update is required. Running it daily does not provide daily backups. A cron job can check for updates:
 
 ```bash
-# Daily backup at 3 AM
+# Daily update check at 3 AM
 0 3 * * * /path/to/scripts/update-server.sh > /dev/null 2>&1
 ```
 
@@ -491,7 +548,7 @@ Add a cron job to run backups periodically:
 
 - The `mcserver` user has limited privileges
 - Screen sessions are configured for specific user access
-- Backups are stored with appropriate permissions
+- Backups are root-controlled and readable only by root
 - Log files are accessible but not world-writable
 
 ## Requirements
@@ -499,7 +556,9 @@ Add a cron job to run backups periodically:
 - Linux (64-bit recommended)
 - bash
 - wget
-- unzip
+- Python 3 (standard library only)
+- GNU coreutils (`realpath`, `timeout`, `stat`)
+- util-linux (`flock`)
 - screen
 - tar
 - sudo
@@ -510,3 +569,50 @@ Add a cron job to run backups periodically:
 ## License
 
 These scripts are provided as-is for managing Minecraft Bedrock servers. Use at your own risk and ensure you comply with Minecraft's terms of service.
+
+## Update safety and recovery
+
+Start, stop, and update mutations require root and share a non-blocking lock in
+`/run/lock/minecraft-bedrock`. Only one management operation can run at a time.
+Update child scripts inherit the lock; the server process does not keep it open.
+
+The updater downloads into a private directory, rejects unsafe ZIP paths, links,
+special files, excessive extracted sizes, and invalid server binaries, then stops
+the server and makes a complete backup. `MAX_EXTRACTED_BYTES` in `config.sh`
+limits uncompressed archive contents (default 4 GiB). The server remains offline
+only for backup, staging, directory promotion, and startup verification.
+
+A replacement is assembled beside the installation on the same filesystem. The
+previous directory is retained until the replacement's process and Screen session
+remain running for 15 seconds. This checks startup survival, not gameplay or
+world compatibility. An error or INT/TERM signal triggers rollback and attempts
+to restore the previous running state. A stopped server stays stopped. Success
+notifications are sent after startup verification, when a restart was required.
+
+Failed transaction directories (`.minecraft-install.*` beside `SERVER_DIR`) are
+retained for inspection. Logs identify these directories and the backup archive.
+If the replacement cannot stop, recovery leaves both installations in place and
+reports the failure. Restore manually after stopping the server; never overwrite
+a running world. SIGKILL, power loss, and machine crashes cannot run cleanup:
+inspect retained transaction directories and backups before starting again.
+Directory promotion uses two renames and therefore has a brief interval with no
+`SERVER_DIR`; external tooling must respect the management lock.
+
+Configuration paths must be absolute, canonical, and disjoint from the server
+installation. Symlinked directories and preservation entries containing traversal
+are rejected. Preserved data must not contain symlinks. Keep the scripts,
+`common.sh`, `validate-archive.py`, `migrate-settings.py`, and `config.sh` writable only by trusted
+administrators: sourcing configuration executes shell code as root. Install these
+files outside the game server's writable directory. Prefer a root-controlled
+parent for backups so the game server user cannot rename the backup directory.
+
+## Development checks
+
+```bash
+for script in *.sh; do bash -n "$script" || exit 1; done
+python3 -m unittest discover -s tests -v
+```
+
+The regression tests use disposable fixtures and mocked network/server commands.
+Linux CI additionally verifies process identity and selective signaling with
+`/proc`. No test downloads Minecraft or operates a live server.
