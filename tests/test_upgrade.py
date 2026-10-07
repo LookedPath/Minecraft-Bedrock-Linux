@@ -89,7 +89,7 @@ class UpgradeTests(unittest.TestCase):
         self.system_aliases.write_text("alias mcstop='/opt/minecraft/stop-server.sh'\n")
         self.config = self.base / 'config.sh'
         # Old installations have TEMP_DIR and no MAX_EXTRACTED_BYTES.
-        config_text = (ROOT / 'config.sh').read_text()
+        config_text = (ROOT / 'config.sh.example').read_text()
         config_text = '\n'.join(line for line in config_text.splitlines() if not line.startswith('MAX_EXTRACTED_BYTES='))
         self.config.write_text(config_text + '\nTEMP_DIR="/tmp/minecraft-update"\n# local customization\n')
         self.config_before = self.config.read_bytes()
@@ -106,12 +106,14 @@ class UpgradeTests(unittest.TestCase):
         fake_chown.chmod(0o755)
         text = (ROOT / 'setup.sh').read_text().removesuffix('main "$@"\n')
         text = text.replace('SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"', f'SCRIPT_DIR={q(str(ROOT))}')
-        text = text.replace('source "$SCRIPT_DIR/config.sh"', f'source {q(str(self.config))}')
+        text = text.replace('if [[ "$mode" == setup && ! -e "$SCRIPT_DIR/config.sh" && ! -L "$SCRIPT_DIR/config.sh" ]]; then', 'if false; then')
         text = text.replace('/etc/profile.d/minecraft.sh', str(self.system_aliases))
         self.library = self.base / 'setup-library.sh'
         self.library.write_text(text)
         self.prefix = f'''
 source {q(str(self.library))}
+source {q(str(self.config))}
+load_config() {{ :; }}
 PATH={q(str(self.bin))}:"$PATH"
 SERVER_DIR={q(str(self.server))}
 BACKUP_DIR={q(str(self.backups))}
@@ -220,7 +222,7 @@ validate_config() { [[ "${INSTALLED:-false}" == true ]]; }
         library = self.base / 'screen-library.sh'
         text = self.library.read_text().replace('/var/run/screen', str(self.base / 'unused')).replace('/run/screen', str(shared))
         library.write_text(text)
-        script = f'source {q(str(library))}\nchown() {{ :; }}\nid() {{ echo mcserver; }}\n'
+        script = f'source {q(str(library))}\nsource {q(str(self.config))}\nchown() {{ :; }}\nid() {{ echo mcserver; }}\n'
         script += "stat() { python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' \"$3\"; }\n"
         script += f'systemd-tmpfiles() {{ printf "%s\\n" "$*" >> {q(str(self.events))}; '
         script += f'chmod 775 {q(str(shared))}; }}\n' if restore else ':; }\n'

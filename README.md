@@ -25,9 +25,11 @@ Initial setup script that prepares the environment:
 - Sets up firewall rules (if UFW is available)
 - Creates helpful command aliases
 
-### `config.sh`
+### `config.sh.example` and local `config.sh`
 
-Configuration file containing all customizable settings:
+The tracked example provides defaults. Setup creates an ignored local `config.sh`
+for your settings and credentials; repository updates leave this local file alone.
+Existing configuration is never overwritten by setup. The configuration contains:
 
 - Server paths and directories
 - Backup retention settings
@@ -92,9 +94,10 @@ Comprehensive management interface:
    cd /path/to/scripts
    ```
 
-2. **Edit the configuration** in `config.sh` if needed:
+2. **Create and edit your local configuration**:
 
    ```bash
+   bash ./setup.sh --init-config
    nano config.sh
    ```
 
@@ -123,9 +126,27 @@ upgrade instead of rerunning the full setup:
 1. Arrange a maintenance window. Pause automatic update jobs and stop the server
    with the **old scripts** before replacing them. If systemd manages the server,
    use `sudo systemctl stop minecraft-bedrock` so it stays stopped.
-2. Save your customized `config.sh`, deploy all files from this release (including
-   `common.sh`, `validate-archive.py`, and `migrate-settings.py`) in the same scripts
-   directory, then restore your configuration. Keep existing paths and credentials.
+2. For the first upgrade from a release that tracked `config.sh`, back it up
+   **before pulling**: Git removes the formerly tracked file in this release.
+   In your existing checkout, run:
+
+   ```bash
+   config_backup=$(mktemp /tmp/minecraft-config.XXXXXXXX)
+   sudo cp -- config.sh "$config_backup"
+   git restore -- config.sh
+   git pull --ff-only
+   sudo install -m 600 "$config_backup" config.sh
+   rm -- "$config_backup"
+   ```
+
+   `git restore` resets only the old tracked configuration after the backup is
+   saved, allowing the pull when it contained local edits. Restore the backup
+   only after a successful pull; keep it if any command fails. Use these commands
+   one at a time and check each result. If deploying downloaded release files,
+   likewise save and restore your local `config.sh` around deployment. Include
+   `config.sh.example`, `common.sh`, `validate-archive.py`, and `migrate-settings.py`.
+   Keep existing paths and credentials. Later Git pulls leave ignored `config.sh`
+   alone; this backup/reset step is needed only for the tracking transition.
 3. Run the upgrade from that directory:
 
    ```bash
@@ -172,6 +193,13 @@ Screen package (for example, `sudo apt-get install --reinstall screen` on
 Debian/Ubuntu) and rerun the upgrade. It will not guess shared directory permissions.
 
 ## Configuration
+
+Run `bash ./setup.sh --init-config` to create `config.sh` from the example if it
+is missing, then edit `config.sh` to customize. The initialization command preserves
+an existing file and creates a new file with mode 600. Normal setup also creates a
+missing configuration and exits so you can review it before rerunning setup.
+`--upgrade` and `--check` require an existing local configuration and never create
+one. Runtime scripts report an actionable error if it is absent.
 
 Edit `config.sh` to customize:
 
@@ -457,7 +485,8 @@ After setup, your file structure will look like:
 ├── minecraft-server.log
 
 /path/to/scripts/              # Management scripts
-├── config.sh
+├── config.sh.example          # Tracked defaults
+├── config.sh                  # Ignored local settings
 ├── setup.sh
 ├── update-server.sh
 ├── start-server.sh
@@ -609,7 +638,7 @@ parent for backups so the game server user cannot rename the backup directory.
 ## Development checks
 
 ```bash
-for script in *.sh; do bash -n "$script" || exit 1; done
+for script in *.sh config.sh.example; do bash -n "$script" || exit 1; done
 python3 -m unittest discover -s tests -v
 ```
 

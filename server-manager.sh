@@ -7,8 +7,8 @@ set -euo pipefail
 
 # Source configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/config.sh"
 source "$SCRIPT_DIR/common.sh"
+load_config
 validate_config || { printf "%s\n" "Unsafe or invalid configuration" >&2; exit 1; }
 
 # Color codes for output

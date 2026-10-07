@@ -7,7 +7,6 @@ set -euo pipefail
 
 # Source configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/config.sh"
 source "$SCRIPT_DIR/common.sh"
 
 # Color codes for output
@@ -432,8 +431,10 @@ upgrade_installation() {
 
 show_usage() {
     cat <<'USAGE'
-Usage: sudo bash setup.sh [--upgrade | --check] [--install-dependencies]
+Usage: bash setup.sh --init-config
+       sudo bash setup.sh [--upgrade | --check] [--install-dependencies]
 
+  --init-config            Create local config.sh from the example, if absent.
   (no mode)                Set up a new server installation.
   --upgrade                Apply compatibility changes to an existing installation.
                            Stop the old server first; safe to rerun.
@@ -449,7 +450,7 @@ main() {
     local mode=setup install_packages=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --upgrade|--check)
+            --upgrade|--check|--init-config)
                 [[ "$mode" == setup ]] || { log ERROR "Choose one setup mode"; return 1; }
                 mode=${1#--} ;;
             --install-dependencies) install_packages=true ;;
@@ -458,9 +459,20 @@ main() {
         esac
         shift
     done
+    if [[ "$mode" == init-config ]]; then
+        [[ "$install_packages" == false ]] || { log ERROR "--init-config cannot install packages"; return 1; }
+        create_local_config
+        return
+    fi
+    if [[ "$mode" == setup && ! -e "$SCRIPT_DIR/config.sh" && ! -L "$SCRIPT_DIR/config.sh" ]]; then
+        create_local_config
+        log INFO "Edit config.sh, then rerun setup with the same options."
+        return
+    fi
     if [[ "$mode" == check && "$install_packages" == true ]]; then
         log ERROR "--check cannot install packages"; return 1
     fi
+    load_config
     check_root
     if [[ "$install_packages" == true ]]; then install_dependencies; fi
     check_requirements

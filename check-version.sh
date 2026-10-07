@@ -7,7 +7,8 @@ set -euo pipefail
 
 # Source configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/config.sh"
+source "$SCRIPT_DIR/common.sh"
+load_config
 CHECK_WORK_DIR=""
 cleanup_check() { [[ -z "$CHECK_WORK_DIR" ]] || rm -rf -- "$CHECK_WORK_DIR"; }
 trap cleanup_check EXIT

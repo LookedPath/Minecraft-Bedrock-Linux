@@ -11,6 +11,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check shell syntax
         run: |
-          for script in *.sh; do bash -n "$script" || exit 1; done
+          for script in *.sh config.sh.example; do bash -n "$script" || exit 1; done
       - name: Run isolated hardening regressions
         run: python3 -m unittest discover -s tests -v

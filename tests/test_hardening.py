@@ -81,6 +81,7 @@ class UpdaterTests(unittest.TestCase):
         self.runtime.touch()
         # Load the actual function bodies, omitting only automatic main execution.
         text = (ROOT / 'update-server.sh').read_text().removesuffix('main "$@"\n')
+        text = text.replace('\nload_config\n', '\nsource "$SCRIPT_DIR/config.sh.example"\n')
         text = text.replace('SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"', f'SCRIPT_DIR={q(str(ROOT))}')
         self.library = self.base / 'updater.sh'
         self.library.write_text(text)
@@ -211,7 +212,7 @@ cleanup_old_backups() {{ :; }}
 
 class SharedChecksTests(unittest.TestCase):
     def run_common(self, script):
-        return subprocess.run(['bash', '-c', f'source {q(str(ROOT / "config.sh"))}\nsource {q(str(ROOT / "common.sh"))}\n' + script], capture_output=True, text=True)
+        return subprocess.run(['bash', '-c', f'source {q(str(ROOT / "config.sh.example"))}\nsource {q(str(ROOT / "common.sh"))}\n' + script], capture_output=True, text=True)
 
     def test_exact_screen_session(self):
         for session, expected in [('minecraft-server-extra', 1), ('minecraft-server', 0)]:
@@ -280,6 +281,7 @@ class LifecycleTests(unittest.TestCase):
     def run_functions(self, name, script):
         with tempfile.TemporaryDirectory() as tmp:
             text = (ROOT / name).read_text().removesuffix('main "$@"\n')
+            text = text.replace('\nload_config\n', '\nsource "$SCRIPT_DIR/config.sh.example"\n')
             text = text.replace('SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"', f'SCRIPT_DIR={q(str(ROOT))}')
             text = text.replace('validate_config || { printf "%s\\n" "Unsafe or invalid configuration" >&2; exit 1; }', ':')
             library = Path(tmp) / name

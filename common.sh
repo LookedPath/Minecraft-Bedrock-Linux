@@ -1,5 +1,27 @@
 #!/bin/bash
-# Shared Linux process and configuration checks. Source after config.sh.
+# Shared configuration loading and Linux process checks.
+
+load_config() {
+    if [[ ! -f "$SCRIPT_DIR/config.sh" ]]; then
+        printf '%s\n' "Missing local config.sh. Run: bash $SCRIPT_DIR/setup.sh --init-config, then edit config.sh." >&2
+        return 1
+    fi
+    source "$SCRIPT_DIR/config.sh"
+}
+
+create_local_config() {
+    local config="$SCRIPT_DIR/config.sh"
+    if [[ -e "$config" || -L "$config" ]]; then
+        printf '%s\n' "Existing config.sh preserved."
+        return 0
+    fi
+    [[ -f "$SCRIPT_DIR/config.sh.example" ]] || {
+        printf '%s\n' "Missing config.sh.example; deploy all release files." >&2; return 1;
+    }
+    # noclobber prevents overwriting a file created concurrently, including symlinks.
+    (umask 077; set -o noclobber; cat -- "$SCRIPT_DIR/config.sh.example" > "$config") || return 1
+    printf '%s\n' "Created config.sh from config.sh.example. Review your settings before setup."
+}
 
 validate_config() {
     local path canonical other entry
