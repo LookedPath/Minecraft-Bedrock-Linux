@@ -19,6 +19,8 @@ STOP_ATTEMPTED=false
 UPDATE_COMMITTED=false
 NEW_PROMOTED=false
 BACKUP_FILE=""
+UPDATE_STEP="Checking configuration"
+LAST_ERROR=""
 
 # Color codes for output
 RED='\033[0;31m'
@@ -32,6 +34,7 @@ log() {
     local level="$1"
     shift
     local message="$*"
+    [[ "$level" != ERROR ]] || LAST_ERROR="$message"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     
     case "$level" in
@@ -44,6 +47,21 @@ log() {
     # Also log to file if log directory exists
     if [[ -d "$LOG_DIR" ]]; then
         echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    fi
+}
+
+# Capture only operational commands, never configuration loading or Telegram requests.
+# Call external commands here, not shell functions: an `if` would disable their errexit.
+run_checked() {
+    local output="$WORK_DIR/command-output.log" status
+    if "$@" >"$output" 2>&1; then
+        cat -- "$output"
+    else
+        status=$?
+        cat -- "$output"
+        LAST_ERROR=$(tail -c 12000 -- "$output")
+        [[ -n "$LAST_ERROR" ]] || LAST_ERROR="Command failed without diagnostic output (exit $status)"
+        return "$status"
     fi
 }
 
@@ -216,18 +234,34 @@ notify_update_success() {
 
 # Send update failure notification
 notify_update_failure() {
-    local error_message="$1"
-    
+    local error_message="$1" message
     if [[ "$TELEGRAM_NOTIFY_UPDATE_FAILURE" == "true" ]]; then
-        local hostname=$(hostname)
-        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        local message="❌ *Minecraft Server Update Failed*%0A%0A"
-        message+="📅 Time: $timestamp%0A"
-        message+="🖥️ Server: $hostname%0A"
-        message+="⚠️ Error: ${error_message:-Unknown error}%0A%0A"
-        message+="🔧 Manual intervention may be required."
-        
-        if send_telegram_message "$message" "Markdown"; then
+        message="❌ Minecraft Server Update Failed
+
+📅 Time: $(date '+%Y-%m-%d %H:%M:%S')
+🖥 Server: $(hostname)
+⚠️ Step: $UPDATE_STEP
+$error_message
+📄 Log: $LOG_FILE
+
+${LAST_ERROR:-No command diagnostic available; check logs.}"
+        # Redact before truncating, strip terminal escapes, and stay below Telegram's
+        # 4096-character limit even when characters require two UTF-16 code units.
+        message=$(printf '%s' "$message" | TELEGRAM_REDACT_TOKEN="$TELEGRAM_BOT_TOKEN" python3 -c '
+import os, re, sys
+text = sys.stdin.read()
+token = os.environ.get("TELEGRAM_REDACT_TOKEN", "")
+if token:
+    text = text.replace(token, "[REDACTED]")
+text = re.sub(r"https://api\.telegram\.org/bot[^\s/]+", "[REDACTED Telegram endpoint]", text)
+text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+text = text.replace("%0A", "\n")
+encoded = text.encode("utf-16-le")
+if len(encoded) > 7600:
+    text = encoded[:7400].decode("utf-16-le", errors="ignore") + "\n[Truncated; see full logs]"
+print(text, end="")
+')
+        if send_telegram_message "$message"; then
             log DEBUG "Update failure notification sent successfully"
         else
             log WARN "Failed to send update failure notification"
@@ -456,13 +490,9 @@ get_latest_download_url() {
     log DEBUG "URL length: ${#download_url} characters"
     log DEBUG "URL starts with: $(echo "$download_url" | head -c 50)..."
     
-    if ! timeout 15 wget --https-only --spider --timeout=10 --user-agent="$USER_AGENT" -q "$download_url" 2>/dev/null; then
-        log ERROR "Download URL is not accessible: $download_url"
-        log ERROR "Please check your internet connection or update the URL manually in config.sh"
-        log DEBUG "Trying wget with verbose output for debugging..."
-        timeout 15 wget --https-only --spider --timeout=10 --user-agent="$USER_AGENT" -v "$download_url" 2>&1 | head -5 || true
-        exit 1
-    fi
+    UPDATE_STEP="Validating download URL"
+    run_checked timeout 15 wget --https-only --spider --timeout=10 --user-agent="$USER_AGENT" -v "$download_url"
+    UPDATE_STEP="Detecting latest version"
     
     log INFO "Using download URL: $download_url"
     if [[ -n "$latest_version" ]]; then
@@ -482,7 +512,7 @@ download_server() {
     }
     log INFO "Downloading server update before shutdown..."
     DOWNLOADED_FILE="$WORK_DIR/bedrock-server-latest.zip"
-    timeout 600 wget --https-only --timeout=30 --tries=3 --user-agent="$USER_AGENT" \
+    run_checked timeout 600 wget --https-only --timeout=30 --tries=3 --user-agent="$USER_AGENT" \
         -O "$DOWNLOADED_FILE" -- "$download_url"
 }
 
@@ -490,7 +520,7 @@ download_server() {
 extract_server() {
     EXTRACTED_DIR="$WORK_DIR/extracted"
     mkdir -- "$EXTRACTED_DIR"
-    python3 "$SCRIPT_DIR/validate-archive.py" "$1" "$EXTRACTED_DIR" \
+    run_checked python3 "$SCRIPT_DIR/validate-archive.py" "$1" "$EXTRACTED_DIR" \
         "$SERVER_EXECUTABLE" "${MAX_EXTRACTED_BYTES:-4294967296}"
     log INFO "Archive contents and executable validated"
 }
@@ -505,7 +535,7 @@ is_server_running() {
 stop_server() {
     if is_server_running; then
         log INFO "Stopping server before backup..."
-        timeout 180 "$SCRIPT_DIR/stop-server.sh" || return 1
+        run_checked timeout 180 "$SCRIPT_DIR/stop-server.sh" || return $?
     fi
     if is_server_running; then
         log ERROR "Server has not stopped; refusing to update"
@@ -515,7 +545,7 @@ stop_server() {
 
 # Start the server using the start-server script
 start_server() {
-    "$SCRIPT_DIR/start-server.sh"
+    run_checked "$SCRIPT_DIR/start-server.sh"
 }
 
 # Create backup of current server
@@ -525,8 +555,8 @@ backup_server() {
     # Include dotfiles and preserve metadata. Publish only a complete, readable archive.
     local partial="$BACKUP_FILE.partial"
     rm -- "$BACKUP_FILE"
-    tar -czf "$partial" -C "$(dirname "$SERVER_DIR")" -- "$(basename "$SERVER_DIR")"
-    tar -tzf "$partial" >/dev/null
+    run_checked tar -czf "$partial" -C "$(dirname "$SERVER_DIR")" -- "$(basename "$SERVER_DIR")"
+    run_checked tar -tzf "$partial" >/dev/null
     mv -- "$partial" "$BACKUP_FILE"
     chmod 600 "$BACKUP_FILE"
     log INFO "Complete backup created: $BACKUP_FILE"
@@ -546,7 +576,7 @@ preserve_files() {
     local entry
     for entry in "${PRESERVE_FILES[@]}" "${WORLD_DIRS[@]}"; do
         if [[ -e "$SERVER_DIR/$entry" || -L "$SERVER_DIR/$entry" ]]; then
-            cp -a -- "$SERVER_DIR/$entry" "$PRESERVED_DIR/"
+            run_checked cp -a -- "$SERVER_DIR/$entry" "$PRESERVED_DIR/"
         fi
     done
 }
@@ -557,12 +587,12 @@ install_server() {
     TRANSACTION_DIR=$(mktemp -d "$(dirname "$SERVER_DIR")/.minecraft-install.XXXXXXXX")
     local stage="$TRANSACTION_DIR/new"
     mkdir -- "$stage"
-    cp -a -- "$extract_dir/." "$stage/"
+    run_checked cp -a -- "$extract_dir/." "$stage/"
     # Replace preserved directories instead of merging with new defaults.
     for entry in "${PRESERVE_FILES[@]}" "${WORLD_DIRS[@]}"; do
         if [[ -e "$preserve_dir/$entry" || -L "$preserve_dir/$entry" ]]; then
             rm -rf -- "$stage/$entry"
-            cp -a -- "$preserve_dir/$entry" "$stage/"
+            run_checked cp -a -- "$preserve_dir/$entry" "$stage/"
         fi
     done
     # Reject symlinks in preserved data before root chmod/chown operations.
@@ -570,15 +600,15 @@ install_server() {
         log ERROR "Symlinks in preserved data require manual review"; return 1
     fi
     store_version_info "$stage"
-    chmod +x "$stage/$SERVER_EXECUTABLE"
-    chown -R "$SERVER_USER:$SERVER_USER" "$stage"
-    chmod 750 "$stage"
+    run_checked chmod +x "$stage/$SERVER_EXECUTABLE"
+    run_checked chown -R "$SERVER_USER:$SERVER_USER" "$stage"
+    run_checked chmod 750 "$stage"
     # Both renames remain on the same filesystem. Keep old files until startup passes.
     if [[ -d "$SERVER_DIR" ]]; then
-        mv -- "$SERVER_DIR" "$TRANSACTION_DIR/old"
+        run_checked mv -- "$SERVER_DIR" "$TRANSACTION_DIR/old"
     fi
     NEW_PROMOTED=true
-    mv -- "$stage" "$SERVER_DIR"
+    run_checked mv -- "$stage" "$SERVER_DIR"
     log INFO "Replacement installed; previous installation retained until verification"
 }
 
@@ -622,12 +652,17 @@ cleanup_temp() {
 
 # Main update process
 main() {
-    validate_config || { printf "%s\n" "Unsafe or invalid configuration" >&2; exit 1; }
+    validate_config || { LAST_ERROR="Unsafe or invalid configuration"; printf "%s\n" "$LAST_ERROR" >&2; exit 1; }
+    UPDATE_STEP="Checking root privileges"
     check_root
+    UPDATE_STEP="Checking system requirements"
     check_requirements
+    UPDATE_STEP="Preparing update workspace"
     setup_directories
+    UPDATE_STEP="Reading installed version"
     get_installed_version
     local installed_version="$INSTALLED_VERSION"
+    UPDATE_STEP="Detecting latest version"
     get_latest_download_url
     local download_url="$DETECTED_DOWNLOAD_URL" latest_version
     latest_version=$(printf '%s\n' "$download_url" | sed -nE 's/.*bedrock-server-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.zip$/\1/p')
@@ -637,15 +672,22 @@ main() {
         return 0
     fi
     notify_update_start "$installed_version"
+    UPDATE_STEP="Downloading server archive"
     download_server "$download_url"
+    UPDATE_STEP="Validating and extracting archive"
     extract_server "$DOWNLOADED_FILE"
     if is_server_running; then SERVER_WAS_RUNNING=true; fi
     STOP_ATTEMPTED=true
+    UPDATE_STEP="Stopping server"
     stop_server
+    UPDATE_STEP="Creating backup"
     backup_server
+    UPDATE_STEP="Preserving server data"
     preserve_files "$EXTRACTED_DIR"
+    UPDATE_STEP="Installing replacement"
     install_server "$EXTRACTED_DIR" "$PRESERVED_DIR"
     if [[ "$SERVER_WAS_RUNNING" == true ]]; then
+        UPDATE_STEP="Starting updated server"
         start_server
     fi
     UPDATE_COMMITTED=true
@@ -657,6 +699,7 @@ main() {
 # EXIT runs for explicit exits and errors; signals use conventional failure statuses.
 finish_update() {
     local status=$? recovery_failed=false
+    local failed_step="$UPDATE_STEP" failure_detail="$LAST_ERROR"
     trap - EXIT ERR INT TERM
     set +e
     if [[ "$status" -ne 0 && "$UPDATE_COMMITTED" != true ]]; then
@@ -682,7 +725,17 @@ finish_update() {
                 start_server || { recovery_failed=true; log ERROR "Previous server could not restart; backup: $BACKUP_FILE"; }
             fi
         fi
-        notify_update_failure "Update failed (exit $status). Recovery files: ${TRANSACTION_DIR:-none}; backup: ${BACKUP_FILE:-none}. Check logs."
+        UPDATE_STEP="$failed_step"
+        LAST_ERROR="$failure_detail"
+        local server_state="Recovery attempted; check server status."
+        if [[ "$STOP_ATTEMPTED" == false ]]; then
+            server_state="Server was not stopped; installation unchanged."
+        elif [[ "$recovery_failed" == true ]]; then
+            server_state="Recovery failed; manual intervention required."
+        fi
+        notify_update_failure "Exit code: $status
+$server_state
+Recovery files: ${TRANSACTION_DIR:-none}; backup: ${BACKUP_FILE:-none}."
     fi
     cleanup_temp
     if [[ -n "$TRANSACTION_DIR" && -d "$TRANSACTION_DIR" ]]; then

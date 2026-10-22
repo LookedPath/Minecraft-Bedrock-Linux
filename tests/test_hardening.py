@@ -210,6 +210,58 @@ cleanup_old_backups() {{ :; }}
         self.assertTrue(self.runtime.exists())
 
 
+class FailureNotificationTests(unittest.TestCase):
+    run_update = UpdaterTests.run_update
+    assert_old = UpdaterTests.assert_old
+
+    def setUp(self):
+        UpdaterTests.setUp(self)
+        self.prefix = self.prefix.replace('notify_update_failure() { echo failure >> "$EVENTS"; }', '')
+        self.prefix += """
+TELEGRAM_ENABLED=true
+TELEGRAM_NOTIFY_UPDATE_FAILURE=true
+TELEGRAM_BOT_TOKEN='123456:test_secret'
+send_telegram_message() {
+    printf '%s' "$1" > "$EVENTS"
+    printf '%s' "${2:-}" > "$EVENTS.mode"
+}
+"""
+
+    def test_dns_error_reports_step_without_stopping_server(self):
+        result = self.run_update('get_latest_download_url() { UPDATE_STEP="Validating download URL"; run_checked bash -c "echo wget: unable to resolve host address www.minecraft.net >&2; exit 4"; }')
+        self.assertEqual(result.returncode, 4, result.stderr)
+        message = self.events.read_text()
+        self.assertIn('Step: Validating download URL', message)
+        self.assertIn('unable to resolve host address', message)
+        self.assertIn('Exit code: 4', message)
+        self.assertIn('Server was not stopped; installation unchanged.', message)
+        self.assertTrue(self.runtime.exists())
+        self.assert_old()
+        self.assertEqual(Path(str(self.events) + '.mode').read_text(), '')
+        self.assertFalse(list(self.base.glob('work.*')))
+
+    def test_redaction_plain_text_and_unicode_limit(self):
+        result = subprocess.run(['bash', '-c', self.prefix + r'''
+trap - EXIT
+LAST_ERROR=$(python3 -c 'print("123456:test_secret https://api.telegram.org/botother-secret/sendMessage _[error] %0A" + "😀" * 6000)')
+notify_update_failure 'Exit code: 1'
+'''], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        message = self.events.read_text()
+        self.assertNotIn('test_secret', message)
+        self.assertNotIn('other-secret', message)
+        self.assertIn('[REDACTED]', message)
+        self.assertIn('_[error]', message)
+        self.assertIn('[Truncated; see full logs]', message)
+        self.assertLessEqual(len(message.encode('utf-16-le')) // 2, 4096)
+
+    def test_recovery_does_not_overwrite_original_error(self):
+        result = self.run_update('extract_server() { LAST_ERROR="archive rejected"; return 8; }; log() { LAST_ERROR="recovery log"; }')
+        self.assertEqual(result.returncode, 8)
+        self.assertIn('archive rejected', self.events.read_text())
+        self.assertNotIn('recovery log', self.events.read_text())
+
+
 class SharedChecksTests(unittest.TestCase):
     def run_common(self, script):
         return subprocess.run(['bash', '-c', f'source {q(str(ROOT / "config.sh.example"))}\nsource {q(str(ROOT / "common.sh"))}\n' + script], capture_output=True, text=True)

@@ -645,3 +645,10 @@ python3 -m unittest discover -s tests -v
 The regression tests use disposable fixtures and mocked network/server commands.
 Linux CI additionally verifies process identity and selective signaling with
 `/proc`. No test downloads Minecraft or operates a live server.
+
+Failure notifications include the failed update step, exit code, recovery paths,
+and a bounded excerpt of command output (for example, DNS, archive validation,
+backup, or startup errors). Failure messages use plain text, redact the configured
+bot token, and link the configured management log by path. Full command output
+remains in the updater's console output (`/var/log/minecraft/auto-update.log` for
+the default cron job). No additional configuration is required.
